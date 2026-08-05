@@ -1,0 +1,37 @@
+[package]
+name = "dvd-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal session capture, frame dedup, rendering and encoding for dvd"
+
+[dependencies]
+anyhow.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+
+rio-vt.workspace = true
+teletypewriter.workspace = true
+
+parley.workspace = true
+skrifa.workspace = true
+vello_cpu.workspace = true
+fearless_simd.workspace = true
+
+image.workspace = true
+less-avc.workspace = true
+
+mp4.workspace = true
+xmlwriter.workspace = true
+base64.workspace = true
+flate2.workspace = true
+corcovado = "0.5.5"
+rio-graphics = "0.5.5"
+
+[dev-dependencies]
+# On a target with NEON or AVX, `dispatch!` prunes the fallback arm entirely —
+# which is the right thing for a release build and useless for a test that
+# claims the scalar and vector paths agree. Enabling the feature here turns it
+# back on for `cargo test` only, via dev-dependency feature unification, so the
+# equivalence tests compare two real implementations instead of one twice.
+fearless_simd = { workspace = true, features = ["force_support_fallback"] }

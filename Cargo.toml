@@ -1,26 +1,53 @@
-[package]
-name = "dvd"
+[workspace]
+resolver = "3"
+members = ["crates/dvd", "crates/dvd-render"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
-# [workspace]
-# resolver = "3"
-# members = ["dvd-tokenizer", "dvd-video", "dvd-renderer", "dvd-cli", "dvd-core"]
-# Input through the CLI
-# Core process in the main-loop, paging out to the renderer
-# Video compiles frames into video, Gif, txt, or SVG
-# Github actions workflow
-# This process could also let us make an alternative to termshot using the crates?
-# https://github.com/homeport/termshot -- By just using the renderer and having the resultant image be the output instead.
-# From the .dvd format (encapuslated in dvd-tokenizer)
-# https://github.com/marionebl/svg-term-cli
-# https://github.com/nbedos/termtosvg
-# https://github.com/homeport/termshot
-
-[dependencies]
+[workspace.dependencies]
 anyhow = "1"
-alacritty_terminal = { version = "0.25.1-dev", git = "https://github.com/alacritty/alacritty.git" }
+rayon = "1"
+rustc-hash = "2.1"
+
+# The terminal core. Everything about VT state, the grid, and the PTY comes
+# from here; `dvd` owns no escape-sequence logic of its own.
+#
+# `graphics` turns on the Sixel, iTerm2 and Kitty image protocols: decoding,
+# the placement bookkeeping, and the geometry helpers for resolving a source
+# rect and clipping an overlay against the viewport. Recreating any of that
+# would be a second, worse implementation of a protocol the VT core already
+# tracks correctly across scroll and resize.
+rio-vt = { version = "0.5.5", features = ["graphics"] }
+teletypewriter = "0.5.5"
+
+# Text. `parley` shapes (harfrust) and resolves fallback (fontique), `skrifa`
+# turns the chosen glyphs into outlines. Neither pulls `glifo`.
+parley = "0.11"
+skrifa = "0.45"
+
+# Rasterization. `default-features = false` is load-bearing: vello_cpu's
+# `text` feature is the only edge in the tree that pulls `glifo`, and we
+# supply glyph outlines ourselves, so dropping the feature drops the crate.
+vello_cpu = { version = "0.1", default-features = false, features = [
+	"std",
+	"u8_pipeline",
+	"multithreading",
+] }
+
+# Shared with vello_cpu, which re-exports `vello_common::fearless_simd::Level` —
+# the same crate at the same version, so one detected `Level` drives both its
+# rasterizer and our kernels.
+fearless_simd = "0.4"
+
+image = { version = "0.25", default-features = false, features = ["png"] }
+less-avc = { version = "0.1.5", features = ["std"] }
+mp4 = "0.14"
+xmlwriter = "0.1"
+base64 = "0.22"
+flate2 = "1"
+
 clap = { version = "4.5", features = ["derive"] }
-dvd-render = { version = "0.2", features = ["video"] }
 regex = "1"
-pollster = "0.4"

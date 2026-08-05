@@ -1,0 +1,17 @@
+[package]
+name = "dvd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Record terminal sessions from a .dvd tape"
+
+[[bin]]
+name = "dvd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+regex.workspace = true
+
+dvd-render = { path = "../dvd-render" }
