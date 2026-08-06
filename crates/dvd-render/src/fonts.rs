@@ -269,13 +269,11 @@ fn measure(
 		cell_width,
 		cell_height,
 		baseline,
-		underline_offset: baseline
-			- underline.map_or(-size * 0.1, |decoration| decoration.offset),
+		underline_offset: baseline - underline.map_or(-size * 0.1, |decoration| decoration.offset),
 		underline_thickness: underline
 			.map_or(default_thickness, |decoration| decoration.thickness)
 			.max(1.0),
-		strikeout_offset: baseline
-			- strikeout.map_or(size * 0.25, |decoration| decoration.offset),
+		strikeout_offset: baseline - strikeout.map_or(size * 0.25, |decoration| decoration.offset),
 		strikeout_thickness: strikeout
 			.map_or(default_thickness, |decoration| decoration.thickness)
 			.max(1.0),
@@ -294,7 +292,8 @@ mod tests {
 		assert!(fonts.metrics.cell_width > 0, "a cell needs a width");
 		assert!(fonts.metrics.cell_height > 0, "a cell needs a height");
 		assert!(
-			fonts.metrics.baseline > 0.0 && fonts.metrics.baseline < fonts.metrics.cell_height as f32,
+			fonts.metrics.baseline > 0.0
+				&& fonts.metrics.baseline < fonts.metrics.cell_height as f32,
 			"the baseline must sit inside the cell, got {} in {}",
 			fonts.metrics.baseline,
 			fonts.metrics.cell_height

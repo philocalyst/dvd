@@ -63,7 +63,7 @@ package target=(system):
 
     # now copy all completion scripts
     comp_dir="{{build_directory}}/{{target}}/release"
-    completions=( lic.bash lic.elv lic.fish _lic.ps1 _lic )
+    completions=( {{main_package}}.bash {{main_package}}.elv {{main_package}}.fish _{{main_package}}.ps1 _{{main_package}} )
 
     for comp in "${completions[@]}"; do
       src="$comp_dir/$comp"
@@ -189,9 +189,35 @@ test:
 
 [doc('Run workspace tests with additional arguments')]
 [group('testing')]
-test-with +args: 
+test-with +args:
     @echo "🧪 Running workspace tests with args: '{{args}}'"
     cargo test --workspace -- '{{args}}'
+
+# Tapes that drive a real external program — `macchina`, `notcurses-demo` — are
+# `#[ignore]`d in the default run. Their output depends on the machine (uptime,
+# memory, terminfo, what is installed), so they cannot be golden fixtures; they
+# are here to be run deliberately, when the question is whether a real TUI still
+# renders correctly.
+[doc('Run the tapes that shell out to real external programs')]
+[group('testing')]
+test-suite:
+    @echo "🎬 Running external-tool tapes..."
+    cargo test --workspace -- --ignored --nocapture
+
+# Regenerating goldens is destructive: it makes every currently failing pixel
+# test pass by definition. Do it when a rendering change was intended, then read
+# `git diff --stat tests/golden` and satisfy yourself the churn is what you meant.
+[doc('Rewrite the golden images from the current renderer output')]
+[group('testing')]
+update-golden:
+    @echo "📸 Rewriting golden images..."
+    DVD_UPDATE_GOLDEN=1 cargo test --workspace
+
+[doc('Report frames per second and output size for a fixed tape')]
+[group('testing')]
+bench:
+    @echo "⏱️  Benchmarking the pipeline..."
+    cargo run --release --package dvd-render --example bench
 
 # --- Code Quality --- #
 [doc('Format all Rust code in the workspace')]
@@ -205,20 +231,34 @@ fmt:
 [group('quality')]
 fmt-check:
     @echo "💅 Checking Rust code formatting..."
-    cargo fmt 
-    
+    cargo fmt --all -- --check
 
+# `--all-targets` is the point: without it Clippy never looks at the test
+# modules, which is where most of this workspace's code lives.
 [doc('Lint code with Clippy in debug mode')]
 [group('quality')]
 lint:
     @echo "🧹 Linting with Clippy (debug)..."
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 [doc('Automatically fix Clippy lints where possible')]
 [group('quality')]
 lint-fix:
     @echo "🩹 Fixing Clippy lints..."
     cargo clippy --workspace --fix --allow-dirty --allow-staged
+
+# --- Fidelity --- #
+
+# Ad-hoc, and deliberately outside `cargo test`: it needs `vhs`, `ffmpeg` and
+# ImageMagick, and its output is images for a person to look at rather than an
+# assertion a machine can make. `macchina` prints live uptime and memory
+# figures, so the two recordings never agree on text — what is being judged is
+# layout, colour, glyph shape and metrics.
+[doc('Render the same tape through dvd and vhs and build comparison images')]
+[group('fidelity')]
+inspect:
+    @echo "🔬 Comparing dvd against vhs..."
+    ./scripts/inspect/compare.sh
 
 # --- Documentation --- #
 [doc('Generate project documentation')]
@@ -291,17 +331,20 @@ clean:
     cargo clean
 
 # --- Installation --- #
+# `--path` is load-bearing. Without it `cargo install` goes looking on crates.io
+# for a crate that is not published there, and installs someone else's `dvd` or
+# nothing at all.
 [doc('Build and install binary to system')]
 [group('installation')]
-install package=(main_package): build-release 
-    @echo "💾 Installing {{main_package}} binary..."
-    cargo install --bin '{{package}}'
+install package=(main_package):
+    @echo "💾 Installing {{package}} binary..."
+    cargo install --path 'crates/{{package}}' --bin '{{package}}'
 
 [doc('Force install binary')]
 [group('installation')]
-install-force package=(main_package): build-release
-    @echo "💾 Force installing {{main_package}} binary..."
-    cargo install --bin '{{package}}' --force
+install-force package=(main_package):
+    @echo "💾 Force installing {{package}} binary..."
+    cargo install --path 'crates/{{package}}' --bin '{{package}}' --force
 
 # --- Aliases --- #
 alias b    := build

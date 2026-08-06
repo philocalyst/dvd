@@ -320,4 +320,79 @@ mod tests {
 		assert_eq!(lexer.next_token().line, 1);
 		assert_eq!(lexer.next_token().line, 2);
 	}
+
+	/// `read_number` accepts any run of digits and dots, with no check that
+	/// what it collects is a single valid number. `parser::parse_time` has to
+	/// cope with the result — this is the token it copes with, pinned down
+	/// so a future change to either side notices the other.
+	#[test]
+	fn a_number_with_several_dots_lexes_as_one_token_the_parser_must_reject() {
+		assert_eq!(
+			tokens("0.0.0.0"),
+			vec![(TokenType::Number, "0.0.0.0".into())]
+		);
+	}
+
+	/// There is no escape mechanism: `read_string` stops at the first quote,
+	/// newline, or end of input, full stop. A backslash is an ordinary
+	/// character, so `\"` does not protect the quote that follows it — the
+	/// string ends there, the `b` after it lexes as its own bare word, and
+	/// the stray closing quote left over opens a third, empty, unterminated
+	/// string rather than pairing back up with anything.
+	#[test]
+	fn a_backslash_does_not_escape_the_closing_quote() {
+		assert_eq!(
+			tokens(r#""a\"b""#),
+			vec![
+				(TokenType::String, "a\\".into()),
+				(TokenType::String, "b".into()),
+				(TokenType::String, String::new()),
+			]
+		);
+	}
+
+	/// A string with no closing quote does not stall the lexer or lose text —
+	/// it simply reads to the end of the input, the same rule that already
+	/// stops it at a newline.
+	#[test]
+	fn an_unterminated_string_reads_to_end_of_input() {
+		assert_eq!(tokens(r#""abc"#), vec![(TokenType::String, "abc".into())]);
+	}
+
+	/// `@` and `+` are always single-character punctuation tokens: nothing
+	/// about being adjacent to a number, a unit, or each other merges them
+	/// into a compound token. This is what lets `parse_ctrl` walk `@10ms+c`
+	/// one token at a time without a special case for the boundary.
+	#[test]
+	fn at_and_plus_never_merge_with_their_neighbours() {
+		assert_eq!(
+			tokens("@10ms+c"),
+			vec![
+				(TokenType::At, "@".into()),
+				(TokenType::Number, "10".into()),
+				(TokenType::Milliseconds, "ms".into()),
+				(TokenType::Plus, "+".into()),
+				(TokenType::String, "c".into()),
+			]
+		);
+	}
+
+	/// `lookup_identifier` is an exact match against `KEYWORDS`, not a
+	/// prefix or case-insensitive one. This is the whole reason an unquoted
+	/// path like `out.mp4` or an unquoted theme name like `nord` lexes as a
+	/// plain `String` — any word that is not *exactly* one of the reserved
+	/// spellings falls through to that arm instead of erroring.
+	#[test]
+	fn a_bare_word_is_a_string_unless_it_matches_a_keyword_exactly() {
+		assert_eq!(tokens("Sleep"), vec![(TokenType::Sleep, "Sleep".into())]);
+		// A keyword-looking prefix that isn't the whole word.
+		assert_eq!(tokens("Sleepy"), vec![(TokenType::String, "Sleepy".into())]);
+		// Case matters: only the lowercase spelling is registered.
+		assert_eq!(tokens("SLEEP"), vec![(TokenType::String, "SLEEP".into())]);
+		// An ordinary unquoted path, which is how `Output out.mp4` works.
+		assert_eq!(
+			tokens("out.mp4"),
+			vec![(TokenType::String, "out.mp4".into())]
+		);
+	}
 }

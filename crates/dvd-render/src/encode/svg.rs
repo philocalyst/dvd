@@ -25,7 +25,9 @@ use rio_vt::crosswords::square::Wide;
 use rio_vt::crosswords::style::StyleFlags;
 
 use crate::fonts::Metrics;
-use crate::model::{Palette, Rgba, Snapshot};
+use crate::geom::Color;
+use crate::grid::GridOptions;
+use crate::model::{Palette, Snapshot};
 use crate::render::Surface;
 use crate::stream::{Ctx, Meta, Sink};
 
@@ -90,7 +92,7 @@ impl Svg {
 				// A sentinel that can never equal a resolved colour, to flush
 				// the last run without duplicating the body of the loop.
 				let color = if column == snapshot.columns {
-					[0, 0, 0, 0]
+					Color::TRANSPARENT
 				} else {
 					self.background_of(snapshot, column, row)
 				};
@@ -99,12 +101,11 @@ impl Svg {
 					if current != default {
 						let _ = write!(
 							out,
-							r#"<rect x="{}" y="{}" width="{}" height="{}" fill="{}"/>"#,
+							r#"<rect x="{}" y="{}" width="{}" height="{}" fill="{current}"/>"#,
 							origin_x + start as u32 * self.metrics.cell_width,
 							origin_y + row as u32 * self.metrics.cell_height,
 							(column - start) as u32 * self.metrics.cell_width,
 							self.metrics.cell_height,
-							hex(current)
 						);
 					}
 					start = column;
@@ -114,9 +115,13 @@ impl Svg {
 		}
 	}
 
-	fn background_of(&self, snapshot: &Snapshot, column: u16, row: u16) -> Rgba {
+	fn background_of(&self, snapshot: &Snapshot, column: u16, row: u16) -> Color {
 		self.palette
-			.resolve(snapshot.cell(column, row), &snapshot.styles)
+			.resolve(
+				snapshot.cell(column, row),
+				&snapshot.styles,
+				&GridOptions::default(),
+			)
 			.background
 	}
 
@@ -131,19 +136,22 @@ impl Svg {
 
 			let mut run = String::new();
 			let mut run_start = 0u16;
-			let mut run_style: Option<(Rgba, StyleFlags)> = None;
+			let mut run_style: Option<(Color, StyleFlags)> = None;
 
-			let flush = |run: &mut String, start: u16, end: u16, style: Option<(Rgba, StyleFlags)>, out: &mut String| {
+			let flush = |run: &mut String,
+			             start: u16,
+			             end: u16,
+			             style: Option<(Color, StyleFlags)>,
+			             out: &mut String| {
 				if run.trim().is_empty() || start == end {
 					run.clear();
 					return;
 				}
-				let (color, flags) = style.unwrap_or(([0xff; 4], StyleFlags::empty()));
+				let (color, flags) = style.unwrap_or((Color::WHITE, StyleFlags::empty()));
 				let _ = write!(
 					out,
-					r#"<text x="{}" y="{baseline}" fill="{}" textLength="{}" lengthAdjust="spacingAndGlyphs"{}>{}</text>"#,
+					r#"<text x="{}" y="{baseline}" fill="{color}" textLength="{}" lengthAdjust="spacingAndGlyphs"{}>{}</text>"#,
 					origin_x + start as u32 * self.metrics.cell_width,
-					hex(color),
 					(end - start) as u32 * self.metrics.cell_width,
 					decorations(flags),
 					escape(run),
@@ -159,7 +167,9 @@ impl Svg {
 					continue;
 				}
 
-				let resolved = self.palette.resolve(cell, &snapshot.styles);
+				let resolved =
+					self.palette
+						.resolve(cell, &snapshot.styles, &GridOptions::default());
 				let style = (resolved.foreground, resolved.flags);
 
 				if run_style != Some(style) {
@@ -208,13 +218,12 @@ impl Svg {
 			CursorShape::Hidden => return,
 		};
 
+		let cursor = self
+			.palette
+			.named(rio_vt::config::colors::NamedColor::Cursor);
 		let _ = write!(
 			out,
-			r#"<rect x="{x}" y="{y}" width="{width}" height="{height}" fill="{}"/>"#,
-			hex(
-				self.palette
-					.named(rio_vt::config::colors::NamedColor::Cursor)
-			)
+			r#"<rect x="{x}" y="{y}" width="{width}" height="{height}" fill="{cursor}"/>"#,
 		);
 	}
 
@@ -268,22 +277,19 @@ impl Svg {
 		if let Some(fill) = self.surface.margin_fill {
 			let _ = write!(
 				out,
-				r#"<rect width="{}" height="{}" fill="{}"/>"#,
-				self.width,
-				self.height,
-				hex(fill)
+				r#"<rect width="{}" height="{}" fill="{fill}"/>"#,
+				self.width, self.height,
 			);
 		}
+		let panel = self
+			.palette
+			.named(rio_vt::config::colors::NamedColor::Background);
 		let _ = write!(
 			out,
-			r#"<rect x="{margin}" y="{margin}" width="{}" height="{}" rx="{}" fill="{}"/>"#,
+			r#"<rect x="{margin}" y="{margin}" width="{}" height="{}" rx="{}" fill="{panel}"/>"#,
 			self.width as u32 - 2 * self.surface.margin,
 			self.height as u32 - 2 * self.surface.margin,
 			self.surface.border_radius,
-			hex(
-				self.palette
-					.named(rio_vt::config::colors::NamedColor::Background)
-			),
 			margin = self.surface.margin,
 		);
 
@@ -364,10 +370,6 @@ fn percent(at: u32, total: u32) -> f64 {
 	(at as f64 * 100.0 / total as f64 * 10_000.0).round() / 10_000.0
 }
 
-fn hex(color: Rgba) -> String {
-	format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2])
-}
-
 /// The SVG spelling of the attributes that survive the trip.
 ///
 /// Bold and italic are real font selections; underline and strikethrough are
@@ -441,7 +443,11 @@ mod tests {
 		assert_eq!(percent(0, 4), 0.0);
 		assert_eq!(percent(1, 4), 25.0);
 		assert_eq!(percent(4, 4), 100.0);
-		assert_eq!(percent(0, 0), 0.0, "an empty timeline must not divide by zero");
+		assert_eq!(
+			percent(0, 0),
+			0.0,
+			"an empty timeline must not divide by zero"
+		);
 	}
 
 	#[test]

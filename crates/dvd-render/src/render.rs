@@ -37,7 +37,9 @@ use vello_cpu::kurbo::{Affine, BezPath, Rect, RoundedRect, Shape};
 use vello_cpu::{Level, Pixmap, RenderContext, RenderSettings, Resources};
 
 use crate::fonts::{Fonts, Metrics};
-use crate::model::{Palette, Rgba, Snapshot};
+use crate::geom::Color;
+use crate::grid::GridOptions;
+use crate::model::{Palette, Snapshot};
 use crate::stream::Rasterizer;
 
 /// How the terminal panel sits on the canvas.
@@ -50,7 +52,7 @@ pub struct Surface {
 	pub border_radius: u32,
 	/// Colour behind the panel. `None` leaves it transparent, so rounded
 	/// corners composite cleanly onto whatever the image is embedded in.
-	pub margin_fill: Option<Rgba>,
+	pub margin_fill: Option<Color>,
 }
 
 impl Default for Surface {
@@ -162,7 +164,8 @@ impl Renderer {
 		// or a video a pixel narrower than the still beside it. One column of
 		// background is a cheaper price than two outputs that disagree.
 		let even = |value: u32| (value + 1) & !1;
-		let width = even(columns as u32 * metrics.cell_width + chrome).min(u16::MAX as u32 - 1) as u16;
+		let width =
+			even(columns as u32 * metrics.cell_width + chrome).min(u16::MAX as u32 - 1) as u16;
 		let height =
 			even(screen_rows as u32 * metrics.cell_height + chrome).min(u16::MAX as u32 - 1) as u16;
 
@@ -219,8 +222,8 @@ impl Renderer {
 		(self.width, self.height)
 	}
 
-	fn paint(color: Rgba) -> AlphaColor<Srgb> {
-		AlphaColor::from_rgba8(color[0], color[1], color[2], color[3])
+	fn paint(color: Color) -> AlphaColor<Srgb> {
+		AlphaColor::from_rgba8(color.red(), color.green(), color.blue(), color.alpha())
 	}
 
 	/// Draw the panel the grid sits on.
@@ -239,10 +242,10 @@ impl Renderer {
 			self.height as f64 - margin,
 		);
 
-		self.context
-			.set_paint(Self::paint(self.palette.named(
-				rio_vt::config::colors::NamedColor::Background,
-			)));
+		self.context.set_paint(Self::paint(
+			self.palette
+				.named(rio_vt::config::colors::NamedColor::Background),
+		));
 
 		if self.surface.border_radius > 0 {
 			let rounded = RoundedRect::from_rect(panel, self.surface.border_radius as f64);
@@ -263,20 +266,22 @@ impl Renderer {
 			.palette
 			.named(rio_vt::config::colors::NamedColor::Background);
 
+		let options = GridOptions::default();
+
 		for row in 0..snapshot.screen_rows {
 			let mut run_start = 0u16;
 			let mut run_color = self
 				.palette
-				.resolve(snapshot.cell(0, row), &snapshot.styles)
+				.resolve(snapshot.cell(0, row), &snapshot.styles, &options)
 				.background;
 
 			for column in 1..=snapshot.columns {
 				let color = if column == snapshot.columns {
 					// Sentinel that always differs, to flush the final run.
-					[0, 0, 0, 0]
+					Color::TRANSPARENT
 				} else {
 					self.palette
-						.resolve(snapshot.cell(column, row), &snapshot.styles)
+						.resolve(snapshot.cell(column, row), &snapshot.styles, &options)
 						.background
 				};
 
@@ -293,7 +298,7 @@ impl Renderer {
 		}
 	}
 
-	fn fill_cells(&mut self, from: u16, to: u16, row: u16, color: Rgba, metrics: Metrics) {
+	fn fill_cells(&mut self, from: u16, to: u16, row: u16, color: Color, metrics: Metrics) {
 		let (origin_x, origin_y) = self.origin;
 		let rect = Rect::new(
 			origin_x + (from as u32 * metrics.cell_width) as f64,
@@ -318,7 +323,9 @@ impl Renderer {
 			if cell.wide() == Wide::Spacer {
 				continue;
 			}
-			let resolved = self.palette.resolve(cell, &snapshot.styles);
+			let resolved = self
+				.palette
+				.resolve(cell, &snapshot.styles, &GridOptions::default());
 			let character = match resolved.character {
 				'\0' => ' ',
 				other => other,
@@ -326,8 +333,7 @@ impl Renderer {
 
 			let start = self.row_text.len();
 			self.row_text.push(character);
-			self.column_of_byte
-				.resize(self.row_text.len(), column);
+			self.column_of_byte.resize(self.row_text.len(), column);
 			debug_assert!(self.column_of_byte.len() > start);
 
 			// Combining marks do not fit in the packed cell, so `rio-vt` parks
@@ -353,12 +359,9 @@ impl Renderer {
 			return;
 		}
 
-		let mut builder = self.layout_context.ranged_builder(
-			&mut self.fonts.context,
-			&self.row_text,
-			1.0,
-			false,
-		);
+		let mut builder =
+			self.layout_context
+				.ranged_builder(&mut self.fonts.context, &self.row_text, 1.0, false);
 		builder.push_default(StyleProperty::FontFamily(FontFamily::List(
 			std::borrow::Cow::Borrowed(&self.families),
 		)));
@@ -493,9 +496,11 @@ impl Renderer {
 		let placed = std::mem::take(&mut self.placed);
 
 		for glyph in &placed {
-			let resolved = self
-				.palette
-				.resolve(snapshot.cell(glyph.column, row), &snapshot.styles);
+			let resolved = self.palette.resolve(
+				snapshot.cell(glyph.column, row),
+				&snapshot.styles,
+				&GridOptions::default(),
+			);
 
 			// A hidden cell resolves to a space, which has no outline anyway;
 			// skipping early avoids the cache lookup.
@@ -535,9 +540,11 @@ impl Renderer {
 		let row_y = origin_y + (row as u32 * metrics.cell_height) as f64;
 
 		for column in 0..snapshot.columns {
-			let resolved = self
-				.palette
-				.resolve(snapshot.cell(column, row), &snapshot.styles);
+			let resolved = self.palette.resolve(
+				snapshot.cell(column, row),
+				&snapshot.styles,
+				&GridOptions::default(),
+			);
 
 			let x0 = origin_x + (column as u32 * metrics.cell_width) as f64;
 			let x1 = x0 + metrics.cell_width as f64;
@@ -577,22 +584,15 @@ impl Renderer {
 		snapshot: &Snapshot,
 		column: u16,
 		row: u16,
-		foreground: Rgba,
-	) -> Rgba {
+		foreground: Color,
+	) -> Color {
 		if !self.cursor_covers(snapshot, column, row) {
 			return foreground;
 		}
 
-		let cursor = self
-			.palette
-			.named(rio_vt::config::colors::NamedColor::Cursor);
-		let luma = 0.2126 * cursor[0] as f32 + 0.7152 * cursor[1] as f32 + 0.0722 * cursor[2] as f32;
-
-		if luma > 128.0 {
-			[0, 0, 0, 255]
-		} else {
-			[255, 255, 255, 255]
-		}
+		self.palette
+			.named(rio_vt::config::colors::NamedColor::Cursor)
+			.contrasting()
 	}
 
 	fn cursor_covers(&self, snapshot: &Snapshot, column: u16, row: u16) -> bool {
@@ -697,8 +697,7 @@ mod tests {
 		if color[3] == 0 || color[3] == 255 {
 			return color;
 		}
-		let unpremultiply =
-			|channel: u8| ((channel as u32 * 255) / color[3] as u32).min(255) as u8;
+		let unpremultiply = |channel: u8| ((channel as u32 * 255) / color[3] as u32).min(255) as u8;
 		[
 			unpremultiply(color[0]),
 			unpremultiply(color[1]),
@@ -711,7 +710,9 @@ mod tests {
 	/// canvas. A crude measure of "how much was drawn", which is all that is
 	/// needed to tell one glyph from a glyph plus its accent.
 	fn ink_count(pixmap: &Pixmap) -> usize {
-		let background = Palette::default().named(rio_vt::config::colors::NamedColor::Background);
+		let background = Palette::default()
+			.named(rio_vt::config::colors::NamedColor::Background)
+			.channels();
 		(0..pixmap.height())
 			.flat_map(|y| (0..pixmap.width()).map(move |x| (x, y)))
 			.filter(|(x, y)| pixel(pixmap, *x, *y) != background)
@@ -719,12 +720,17 @@ mod tests {
 	}
 
 	/// Any pixel in the cell that is not the background — i.e. ink was laid down.
-	fn cell_has_ink(pixmap: &Pixmap, metrics: Metrics, column: u16, row: u16, background: [u8; 4]) -> bool {
+	fn cell_has_ink(
+		pixmap: &Pixmap,
+		metrics: Metrics,
+		column: u16,
+		row: u16,
+		background: [u8; 4],
+	) -> bool {
 		let x0 = column as u32 * metrics.cell_width;
 		let y0 = row as u32 * metrics.cell_height;
 		(y0..y0 + metrics.cell_height).any(|y| {
-			(x0..x0 + metrics.cell_width)
-				.any(|x| pixel(pixmap, x as u16, y as u16) != background)
+			(x0..x0 + metrics.cell_width).any(|x| pixel(pixmap, x as u16, y as u16) != background)
 		})
 	}
 
@@ -780,7 +786,9 @@ mod tests {
 		snapshot.cells.fill(Square::from_char(' '));
 		renderer.render(&snapshot, &mut pixmap);
 
-		let background = Palette::default().named(rio_vt::config::colors::NamedColor::Background);
+		let background = Palette::default()
+			.named(rio_vt::config::colors::NamedColor::Background)
+			.channels();
 		assert_eq!(pixel(&pixmap, 0, 0), background);
 		assert_eq!(pixel(&pixmap, width - 1, height - 1), background);
 	}
@@ -801,7 +809,9 @@ mod tests {
 
 		renderer.render(&snapshot, &mut pixmap);
 
-		let background = Palette::default().named(rio_vt::config::colors::NamedColor::Background);
+		let background = Palette::default()
+			.named(rio_vt::config::colors::NamedColor::Background)
+			.channels();
 		assert!(
 			cell_has_ink(&pixmap, metrics, 3, 0, background),
 			"the glyph should be drawn in column 3"
@@ -830,9 +840,15 @@ mod tests {
 
 		renderer.render(&snapshot, &mut pixmap);
 
-		let cursor = Palette::default().named(rio_vt::config::colors::NamedColor::Cursor);
+		let cursor = Palette::default()
+			.named(rio_vt::config::colors::NamedColor::Cursor)
+			.channels();
 		assert_eq!(
-			pixel(&pixmap, (metrics.cell_width / 2) as u16, (metrics.cell_height / 2) as u16),
+			pixel(
+				&pixmap,
+				(metrics.cell_width / 2) as u16,
+				(metrics.cell_height / 2) as u16
+			),
 			cursor,
 			"the cursor cell should be filled with the cursor colour"
 		);
@@ -856,7 +872,9 @@ mod tests {
 
 		renderer.render(&snapshot, &mut pixmap);
 
-		let background = Palette::default().named(rio_vt::config::colors::NamedColor::Background);
+		let background = Palette::default()
+			.named(rio_vt::config::colors::NamedColor::Background)
+			.channels();
 		let inked = (0..4)
 			.filter(|column| cell_has_ink(&pixmap, metrics, *column, 0, background))
 			.count();
@@ -898,7 +916,9 @@ mod tests {
 
 			renderer.render(&snapshot, &mut pixmap);
 
-			let background = Palette::default().named(rio_vt::config::colors::NamedColor::Background);
+			let background = Palette::default()
+				.named(rio_vt::config::colors::NamedColor::Background)
+				.channels();
 			assert!(
 				cell_has_ink(&pixmap, metrics, 1, 0, background),
 				"{name} (U+{:04X}) should draw something",
@@ -935,7 +955,9 @@ mod tests {
 
 		renderer.render(&snapshot, &mut pixmap);
 
-		let background = Palette::default().named(rio_vt::config::colors::NamedColor::Background);
+		let background = Palette::default()
+			.named(rio_vt::config::colors::NamedColor::Background)
+			.channels();
 		for column in 0..8u16 {
 			assert!(
 				cell_has_ink(&pixmap, metrics, column, 0, background),
@@ -993,7 +1015,9 @@ mod tests {
 			ink_count(&pixmap) > base,
 			"the accent should add ink on top of the bare letter"
 		);
-		let background = Palette::default().named(rio_vt::config::colors::NamedColor::Background);
+		let background = Palette::default()
+			.named(rio_vt::config::colors::NamedColor::Background)
+			.channels();
 		assert!(
 			!cell_has_ink(&pixmap, metrics, 2, 0, background),
 			"a zero-width mark must not take a column of its own"

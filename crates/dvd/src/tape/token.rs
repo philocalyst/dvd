@@ -230,33 +230,6 @@ pub fn is_setting(token_type: &TokenType) -> bool {
 	)
 }
 
-pub fn is_command(token_type: &TokenType) -> bool {
-	matches!(
-		token_type,
-		TokenType::Type
-			| TokenType::Sleep
-			| TokenType::Up
-			| TokenType::Down
-			| TokenType::Right
-			| TokenType::Left
-			| TokenType::PageUp
-			| TokenType::PageDown
-			| TokenType::Enter
-			| TokenType::Backspace
-			| TokenType::Delete
-			| TokenType::Tab
-			| TokenType::Escape
-			| TokenType::Home
-			| TokenType::Insert
-			| TokenType::End
-			| TokenType::Ctrl
-			| TokenType::Screenshot
-			| TokenType::Copy
-			| TokenType::Paste
-			| TokenType::Wait
-	)
-}
-
 pub fn is_modifier(token_type: &TokenType) -> bool {
 	matches!(token_type, TokenType::Alt | TokenType::Shift)
 }

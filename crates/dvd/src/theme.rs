@@ -12,6 +12,7 @@ use anyhow::{Result, bail};
 use dvd_render::rio_vt::config::colors::{ColorArray, Colors};
 
 /// One scheme, as the hex strings a theme is normally published in.
+#[derive(Debug)]
 pub struct Theme {
 	pub name: &'static str,
 	pub background: u32,
@@ -139,8 +140,24 @@ impl Theme {
 		colors.cursor = channels(self.cursor);
 		colors.vi_cursor = channels(self.cursor);
 
-		let [black, red, green, yellow, blue, magenta, cyan, white, light_black, light_red, light_green, light_yellow, light_blue, light_magenta, light_cyan, light_white] =
-			self.ansi.map(channels);
+		let [
+			black,
+			red,
+			green,
+			yellow,
+			blue,
+			magenta,
+			cyan,
+			white,
+			light_black,
+			light_red,
+			light_green,
+			light_yellow,
+			light_blue,
+			light_magenta,
+			light_cyan,
+			light_white,
+		] = self.ansi.map(channels);
 
 		colors.black = black;
 		colors.red = red;
@@ -162,16 +179,6 @@ impl Theme {
 
 		colors
 	}
-
-	/// The background, as the bytes a margin fill wants.
-	pub fn background_rgba(&self) -> [u8; 4] {
-		[
-			(self.background >> 16) as u8,
-			(self.background >> 8) as u8,
-			self.background as u8,
-			0xff,
-		]
-	}
 }
 
 /// `0xRRGGBB` to the normalised quad `rio-vt` stores colours as.
@@ -187,6 +194,7 @@ fn channels(hex: u32) -> ColorArray {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use dvd_render::geom::Color;
 
 	#[test]
 	fn every_theme_resolves_by_its_own_name() {
@@ -204,7 +212,10 @@ mod tests {
 	fn an_unknown_theme_lists_the_ones_that_exist() {
 		let error = resolve("no-such-theme").unwrap_err().to_string();
 		assert!(error.contains("no-such-theme"));
-		assert!(error.contains("dracula"), "the error should name the options");
+		assert!(
+			error.contains("dracula"),
+			"the error should name the options"
+		);
 	}
 
 	#[test]
@@ -217,11 +228,23 @@ mod tests {
 		assert_eq!(colors.background.0[3], 1.0);
 	}
 
+	/// The whole path a theme colour actually travels: hex string in the table
+	/// here, through `rio-vt`'s normalised `[f32; 4]`, and back out as the bytes
+	/// the renderer and both encoders paint with. Asserting the ends match is
+	/// what catches a rounding change in the middle.
 	#[test]
-	fn the_background_bytes_match_the_hex() {
+	fn a_theme_colour_survives_the_round_trip_to_bytes() {
+		let theme = resolve("dracula").unwrap();
+		let colors = theme.colors();
+
 		assert_eq!(
-			resolve("dracula").unwrap().background_rgba(),
-			[0x28, 0x2a, 0x36, 0xff]
+			Color::from_vt(colors.background.0),
+			Color::rgb(0x28, 0x2a, 0x36)
 		);
+		assert_eq!(
+			Color::from_vt(colors.foreground),
+			Color::rgb(0xf8, 0xf8, 0xf2)
+		);
+		assert_eq!(Color::from_vt(colors.red), Color::rgb(0xff, 0x55, 0x55));
 	}
 }

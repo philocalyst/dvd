@@ -28,6 +28,7 @@ use regex::Regex;
 
 use dvd_render::encode::{mp4::Mp4, png::Png, svg::Svg};
 use dvd_render::fonts::Fonts;
+use dvd_render::geom::Color;
 use dvd_render::model::{Palette, Snapshot};
 use dvd_render::render::{Renderer, Surface};
 use dvd_render::session::{Capture, Session};
@@ -158,9 +159,9 @@ fn parse_color(value: &str) -> Result<[u8; 4]> {
 
 	let (r, g, b) = match hex.len() {
 		3 => {
-			let mut nibble = hex.chars().map(|c| {
-				u8::from_str_radix(&c.to_string(), 16).map(|value| value * 17)
-			});
+			let mut nibble = hex
+				.chars()
+				.map(|c| u8::from_str_radix(&c.to_string(), 16).map(|value| value * 17));
 			(
 				nibble.next().transpose()?,
 				nibble.next().transpose()?,
@@ -185,7 +186,7 @@ fn parse_color(value: &str) -> Result<[u8; 4]> {
 struct Plan {
 	settings: Settings,
 	environment: Vec<(String, String)>,
-	outputs: Vec<PathBuf>,
+	outputs: Vec<(PathBuf, Output)>,
 	steps: Vec<Commands>,
 }
 
@@ -206,7 +207,7 @@ fn plan(commands: Vec<Commands>) -> Result<Plan> {
 		match command {
 			Commands::Set(set) => plan.settings.apply(&set.setting),
 			Commands::Env(env) => plan.environment.push((env.variable, env.value)),
-			Commands::Output(output) => plan.outputs.push(output.path),
+			Commands::Output(output) => plan.outputs.push((output.path, output.format)),
 			Commands::Require(require) => {
 				if which(&require.program).is_none() {
 					bail!(
@@ -223,49 +224,40 @@ fn plan(commands: Vec<Commands>) -> Result<Plan> {
 }
 
 /// Build the sinks for a set of output paths.
+///
+/// The format for each path already came from the tape's `Output` command (or
+/// from the CLI's own `--output`, validated by clap before this ever runs) —
+/// re-deriving it from the extension a second time would just be two places
+/// that can disagree about what `.gif` means.
 fn sinks(
-	paths: &[PathBuf],
+	outputs: &[(PathBuf, Output)],
 	renderer: &Renderer,
 	fonts: &Fonts,
 	palette: &Palette,
 	surface: Surface,
 	level: Level,
-) -> Result<Vec<Box<dyn Sink>>> {
-	let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
-
-	for path in paths {
-		let extension = path
-			.extension()
-			.and_then(|extension| extension.to_str())
-			.unwrap_or_default();
-
-		let format = Output::from_extension(extension).with_context(|| {
-			format!(
-				"{} has no output format; use one of {}",
-				path.display(),
-				Output::allowed_extensions().join(", ")
-			)
-		})?;
-
-		sinks.push(match format {
-			Output::Png => Box::new(Png::new(path.clone())),
-			Output::Mp4 => Box::new(Mp4::new(
-				path.clone(),
-				level,
-				palette.named(rio_vt::config::colors::NamedColor::Background),
-			)),
-			Output::Svg => Box::new(Svg::new(
-				path.clone(),
-				renderer.metrics(),
-				surface,
-				palette.clone(),
-				fonts.family.clone(),
-				fonts.size,
-			)),
-		});
-	}
-
-	Ok(sinks)
+) -> Vec<Box<dyn Sink>> {
+	outputs
+		.iter()
+		.map(|(path, format)| -> Box<dyn Sink> {
+			match format {
+				Output::Png => Box::new(Png::new(path.clone())),
+				Output::Mp4 => Box::new(Mp4::new(
+					path.clone(),
+					level,
+					palette.named(rio_vt::config::colors::NamedColor::Background),
+				)),
+				Output::Svg => Box::new(Svg::new(
+					path.clone(),
+					renderer.metrics(),
+					surface,
+					palette.clone(),
+					fonts.family.clone(),
+					fonts.size,
+				)),
+			}
+		})
+		.collect()
 }
 
 /// `dvd burn`: run a tape and write every output it names.
@@ -288,9 +280,21 @@ pub fn burn(args: &BurnArgs) -> Result<()> {
 	let mut plan = plan(commands)?;
 
 	// The path on the command line is an output like any other, and it is the
-	// one the user typed most recently, so it goes last.
-	if !plan.outputs.contains(&args.output_file) {
-		plan.outputs.push(args.output_file.clone());
+	// one the user typed most recently, so it goes last. Its extension is
+	// already known to be one of `Output::allowed_extensions()` — clap's
+	// `value_parser` rejected anything else before `burn` ever ran.
+	if !plan
+		.outputs
+		.iter()
+		.any(|(path, _)| path == &args.output_file)
+	{
+		let format = args
+			.output_file
+			.extension()
+			.and_then(|extension| extension.to_str())
+			.and_then(Output::from_extension)
+			.expect("clap's value_parser already validated this extension");
+		plan.outputs.push((args.output_file.clone(), format));
 	}
 
 	record(plan)
@@ -326,7 +330,8 @@ fn record(plan: Plan) -> Result<()> {
 			.margin_fill
 			.as_deref()
 			.map(parse_color)
-			.transpose()?,
+			.transpose()?
+			.map(Color::from),
 	};
 
 	// The tape gives a canvas size in pixels; the terminal needs a grid. The
@@ -355,9 +360,16 @@ fn record(plan: Plan) -> Result<()> {
 		settings.font_size,
 		settings.line_height,
 	)?;
-	let sinks = sinks(&outputs, &renderer, &fonts_for_svg, &palette, surface, level)?;
+	let sinks = sinks(
+		&outputs,
+		&renderer,
+		&fonts_for_svg,
+		&palette,
+		surface,
+		level,
+	);
 
-	let mut session = Session::open(
+	let session = Session::open(
 		&settings.shell,
 		Vec::new(),
 		std::env::current_dir()
@@ -430,8 +442,8 @@ fn record(plan: Plan) -> Result<()> {
 		.map_err(|_| anyhow::anyhow!("the encoder thread panicked"))?
 		.context("encoding")?;
 
-	for output in &outputs {
-		println!("wrote {}", output.display());
+	for (path, _) in &outputs {
+		println!("wrote {}", path.display());
 	}
 
 	Ok(())
@@ -618,8 +630,9 @@ fn run_steps(
 			}
 
 			Commands::Key(key) => {
-				let bytes = key_bytes(&key.key)
-					.with_context(|| format!("{:?} is not a key this recorder can send", key.key))?;
+				let bytes = key_bytes(&key.key).with_context(|| {
+					format!("{:?} is not a key this recorder can send", key.key)
+				})?;
 				let rate = key.rate.unwrap_or(settings.typing_speed);
 
 				// `repeat_count` is zero when the tape wrote a bare key with no
@@ -665,9 +678,7 @@ fn run_steps(
 					.push(shot.path.clone());
 				// Give the pump a tick to notice, so the still is of the screen
 				// as it is now rather than of whatever comes next.
-				std::thread::sleep(Duration::from_secs_f64(
-					2.0 / settings.framerate as f64,
-				));
+				std::thread::sleep(Duration::from_secs_f64(2.0 / settings.framerate as f64));
 			}
 
 			Commands::Copy(copy) => clipboard = copy.text.clone(),
@@ -684,11 +695,7 @@ fn run_steps(
 	Ok(())
 }
 
-fn type_text(
-	text: &str,
-	rate: Duration,
-	write: &impl Fn(Vec<u8>) -> Result<()>,
-) -> Result<()> {
+fn type_text(text: &str, rate: Duration, write: &impl Fn(Vec<u8>) -> Result<()>) -> Result<()> {
 	// Character by character rather than all at once: the point of a recording
 	// is to look like someone typing, and a shell with readline echoes each
 	// byte as it arrives.
@@ -702,12 +709,7 @@ fn type_text(
 	Ok(())
 }
 
-fn await_screen(
-	stage: &Stage,
-	pattern: &Regex,
-	mode: &WaitMode,
-	timeout: Duration,
-) -> Result<()> {
+fn await_screen(stage: &Stage, pattern: &Regex, mode: &WaitMode, timeout: Duration) -> Result<()> {
 	let deadline = Instant::now() + timeout;
 
 	while Instant::now() < deadline {
@@ -722,7 +724,10 @@ fn await_screen(
 		std::thread::sleep(Duration::from_millis(10));
 	}
 
-	bail!("waited {timeout:?} for /{}/ and it never matched", pattern.as_str())
+	bail!(
+		"waited {timeout:?} for /{}/ and it never matched",
+		pattern.as_str()
+	)
 }
 
 /// The bytes a terminal sends for a named key.
@@ -880,15 +885,14 @@ mod tests {
 
 	#[test]
 	fn the_plan_separates_configuration_from_steps() {
-		let (commands, errors) = tape::parse(
-			"Set Width 800\nSet Theme \"nord\"\nOutput out.gif\nType \"hi\"\nEnter",
-		);
+		let (commands, errors) =
+			tape::parse("Set Width 800\nSet Theme \"nord\"\nOutput out.mp4\nType \"hi\"\nEnter");
 		assert!(errors.is_empty(), "{errors:?}");
 
 		let plan = plan(commands).unwrap();
 		assert_eq!(plan.settings.width, 800);
 		assert_eq!(plan.settings.theme, "nord");
-		assert_eq!(plan.outputs, vec![PathBuf::from("out.gif")]);
+		assert_eq!(plan.outputs, vec![(PathBuf::from("out.mp4"), Output::Mp4)]);
 		assert_eq!(plan.steps.len(), 2, "Type and Enter are the only steps");
 	}
 

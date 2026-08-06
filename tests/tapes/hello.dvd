@@ -1,0 +1,15 @@
+# The smallest tape that exercises the whole chain: a keystroke reaches the
+# PTY, the shell echoes it, the pump sees a distinct frame, and every sink
+# writes a file. If this one breaks, nothing else is worth debugging yet.
+
+Set Shell "bash"
+Set Theme "dracula"
+Set FontSize 22
+Set Width 1200
+Set Height 600
+Set Padding 60
+Set Framerate 50
+
+Type "echo hello gamers"
+Enter
+Sleep 1s

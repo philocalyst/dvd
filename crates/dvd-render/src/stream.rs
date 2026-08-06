@@ -87,13 +87,17 @@ pub struct Pooled<T> {
 impl<T> std::ops::Deref for Pooled<T> {
 	type Target = T;
 	fn deref(&self) -> &T {
-		self.item.as_ref().expect("a live loan always holds its item")
+		self.item
+			.as_ref()
+			.expect("a live loan always holds its item")
 	}
 }
 
 impl<T> std::ops::DerefMut for Pooled<T> {
 	fn deref_mut(&mut self) -> &mut T {
-		self.item.as_mut().expect("a live loan always holds its item")
+		self.item
+			.as_mut()
+			.expect("a live loan always holds its item")
 	}
 }
 
@@ -259,7 +263,9 @@ impl Dedup {
 		self.previous.styles.extend_from_slice(&candidate.styles);
 		self.previous.extras.clone_from(&candidate.extras);
 		self.previous.graphics.clear();
-		self.previous.graphics.extend(candidate.graphics.iter().cloned());
+		self.previous
+			.graphics
+			.extend(candidate.graphics.iter().cloned());
 		self.previous.cursor = candidate.cursor.clone();
 		self.previous.cursor_visible = candidate.cursor_visible;
 		self.previous_hash = hash;
@@ -382,9 +388,7 @@ mod tests {
 
 	fn screen(columns: u16, rows: u16, fill: char) -> Snapshot {
 		let mut snapshot = Snapshot::new(columns, rows);
-		snapshot
-			.cells
-			.fill(Square::from_char(fill));
+		snapshot.cells.fill(Square::from_char(fill));
 		snapshot
 	}
 
@@ -394,7 +398,10 @@ mod tests {
 		let frame = screen(8, 2, 'a');
 
 		assert!(dedup.admit(&frame), "the first frame is always new");
-		assert!(!dedup.admit(&frame), "an identical repaint is not a new picture");
+		assert!(
+			!dedup.admit(&frame),
+			"an identical repaint is not a new picture"
+		);
 		assert!(!dedup.admit(&frame));
 	}
 
@@ -519,6 +526,7 @@ mod tests {
 				.send(Frame {
 					snapshot: Arc::new(Snapshot::new(4, 4)),
 					hold: 2,
+					stills: Vec::new(),
 				})
 				.unwrap();
 		}
@@ -556,6 +564,7 @@ mod tests {
 				.send(Frame {
 					snapshot: Arc::new(Snapshot::new(4, 4)),
 					hold: 1,
+					stills: Vec::new(),
 				})
 				.unwrap();
 		}
@@ -563,8 +572,16 @@ mod tests {
 
 		encoder.run(receiver, meta()).unwrap();
 
-		assert_eq!(renders.load(Ordering::Relaxed), 0, "nothing should be drawn");
-		assert_eq!(frames.load(Ordering::Relaxed), 5, "the sink still sees them");
+		assert_eq!(
+			renders.load(Ordering::Relaxed),
+			0,
+			"nothing should be drawn"
+		);
+		assert_eq!(
+			frames.load(Ordering::Relaxed),
+			5,
+			"the sink still sees them"
+		);
 		assert_eq!(pixels.load(Ordering::Relaxed), 0);
 	}
 
@@ -590,6 +607,7 @@ mod tests {
 				.send(Frame {
 					snapshot: Arc::new(Snapshot::new(4, 4)),
 					hold: 1,
+					stills: Vec::new(),
 				})
 				.unwrap();
 		}

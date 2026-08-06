@@ -33,6 +33,8 @@ pub use vello_cpu::Pixmap;
 
 pub mod encode;
 pub mod fonts;
+pub mod geom;
+pub mod grid;
 pub mod model;
 pub mod render;
 pub mod session;

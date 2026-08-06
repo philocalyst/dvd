@@ -16,7 +16,10 @@ use crate::stream::{Ctx, Meta, Sink};
 /// Shared with the `Screenshot` command, which needs exactly this and has no
 /// sink of its own.
 pub fn write(path: &Path, pixmap: &Pixmap) -> Result<()> {
-	if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+	if let Some(parent) = path
+		.parent()
+		.filter(|parent| !parent.as_os_str().is_empty())
+	{
 		std::fs::create_dir_all(parent)
 			.with_context(|| format!("creating {}", parent.display()))?;
 	}
@@ -77,7 +80,10 @@ impl Sink for Png {
 
 	fn finish(self: Box<Self>) -> Result<()> {
 		let Some(rgba) = self.latest else {
-			anyhow::bail!("no frames were captured, so {} has nothing to show", self.path.display());
+			anyhow::bail!(
+				"no frames were captured, so {} has nothing to show",
+				self.path.display()
+			);
 		};
 
 		if let Some(parent) = self

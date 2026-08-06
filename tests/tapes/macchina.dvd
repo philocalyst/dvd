@@ -1,0 +1,51 @@
+# The Phase 1 fidelity subject: run `macchina`, a real system-info TUI that
+# exercises coloured labels, a vertical bar, Unicode glyphs and a busy grid of
+# short text runs — the kind of output a recording tool is actually judged on,
+# as opposed to a bare shell prompt. `scripts/inspect/compare.sh` burns this
+# tape and burns `macchina.vhs.tape` (the closest VHS can get to the same
+# terminal) and diffs the two.
+#
+# Every `Set` below has a value chosen to match the VHS twin as closely as the
+# two languages allow. Anything without a `dvd` equivalent is noted there, not
+# here, since this is the file that has everything `dvd` supports.
+
+Set Shell "bash"
+Set FontFamily "Menlo"
+Set FontSize 18
+Set Width 1200
+Set Height 700
+Set Padding 24
+Set Theme "dracula"
+Set Framerate 30
+Set TypingSpeed 40ms
+# Not `false`. `Set CursorBlink false` (also the burn-time default) makes
+# crates/dvd/src/burn.rs:374 write the raw byte sequence `\x1b[?12l` through
+# `session.write`, which delivers it to the PTY as if a user had typed it,
+# rather than feeding it to the VT parser that models the emulated terminal's
+# own state. The shell's line editor cannot interpret a DECRST-12 control
+# sequence arriving as keyboard input; it re-echoes fragments of it and
+# spliced them into the very next keystrokes, and on this machine that turns
+# the first `Type "macchina"` below into a bogus, failing command (confirmed
+# by burning this tape with the setting flipped both ways — see the W7
+# report). `true` skips that write entirely, at the cost of a cursor that can
+# be mid-blink in whichever frame `ffmpeg` happens to land on.
+Set CursorBlink true
+
+# A beat before the first keystroke, so `Type` does not race the shell's own
+# startup banner — without it, characters typed before the shell has claimed
+# the terminal can interleave with its boot output instead of landing after
+# the prompt.
+Sleep 500ms
+
+Type "macchina"
+Enter
+
+# `Wait` blocks on the shell prompt reappearing, i.e. until macchina has
+# finished printing and control has returned — the same signal a human would
+# wait for before taking a screenshot.
+Wait
+
+# macchina's own output settles the instant it prints, but real terminals and
+# `vhs`'s ttyd+chromium capture path both need a beat to stop redrawing; this
+# keeps the still comparable to VHS's without becoming the thing being timed.
+Sleep 2s

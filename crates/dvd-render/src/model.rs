@@ -18,8 +18,8 @@ use rio_vt::crosswords::square::{Extras, Square, Wide};
 use rio_vt::crosswords::style::{Style, StyleFlags};
 use rustc_hash::FxHashMap;
 
-/// Straight, non-premultiplied 8-bit RGBA.
-pub type Rgba = [u8; 4];
+use crate::geom::Color;
+use crate::grid::GridOptions;
 
 /// An image decoded from Sixel, iTerm2 or the Kitty graphics protocol, placed
 /// somewhere on the screen.
@@ -211,10 +211,10 @@ impl Snapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedCell {
 	pub character: char,
-	pub foreground: Rgba,
-	pub background: Rgba,
+	pub foreground: Color,
+	pub background: Color,
 	/// Explicit underline colour (SGR 58), when the cell sets one.
-	pub underline: Option<Rgba>,
+	pub underline: Option<Color>,
 	pub flags: StyleFlags,
 	pub wide: Wide,
 }
@@ -227,6 +227,12 @@ pub struct ResolvedCell {
 #[derive(Clone, Debug)]
 pub struct Palette {
 	colors: List,
+	/// The cursor colour. Kept separate from `colors` because `List::from`
+	/// fills the ANSI cube and the named defaults but never the `Cursor` entry —
+	/// it is a frontend colour, not a grid one — so reading it back through
+	/// `NamedColor::Cursor` returns the transparent black the table was seeded
+	/// with. The renderer and the SVG both draw the caret from here instead.
+	cursor: Color,
 }
 
 impl Default for Palette {
@@ -237,52 +243,72 @@ impl Default for Palette {
 
 impl Palette {
 	pub fn new(colors: List) -> Self {
-		Self { colors }
+		// `List` alone cannot name its own cursor — same gap as `from_colors`,
+		// given the default `Colors` the entries were derived from.
+		Self::from_colors(&Colors::default()).with_list(colors)
+	}
+
+	fn with_list(mut self, colors: List) -> Self {
+		self.colors = colors;
+		self
 	}
 
 	/// Build the 256-entry table from a named-colour set.
 	///
 	/// `List::from` is what fills the 6x6x6 cube and the 24-step grey ramp, so
 	/// going through it means indexed colours land exactly where the VT core
-	/// expects them rather than on a second, hand-rolled ramp.
+	/// expects them rather than on a second, hand-rolled ramp. The cursor is
+	/// taken from the same set, held out of the list for the reason above.
 	pub fn from_colors(colors: &Colors) -> Self {
 		Self {
 			colors: List::from(colors),
+			cursor: Color::from_vt(colors.cursor),
 		}
 	}
 
 	/// The colour a bare `AnsiColor` names.
 	#[inline]
-	pub fn lookup(&self, color: AnsiColor) -> Rgba {
+	pub fn lookup(&self, color: AnsiColor) -> Color {
 		match color {
-			AnsiColor::Named(named) => float_to_rgba(self.colors[named]),
-			AnsiColor::Indexed(index) => float_to_rgba(self.colors[index as usize]),
-			AnsiColor::Spec(ColorRgb { r, g, b }) => [r, g, b, 0xff],
+			AnsiColor::Named(named) => Color::from_vt(self.colors[named]),
+			AnsiColor::Indexed(index) => Color::from_vt(self.colors[index as usize]),
+			AnsiColor::Spec(ColorRgb { r, g, b }) => Color::rgb(r, g, b),
 		}
 	}
 
 	#[inline]
-	pub fn named(&self, named: NamedColor) -> Rgba {
-		float_to_rgba(self.colors[named])
+	pub fn named(&self, named: NamedColor) -> Color {
+		match named {
+			// See the field on the struct: `List` has no entry for the cursor.
+			NamedColor::Cursor => self.cursor,
+			other => Color::from_vt(self.colors[other]),
+		}
 	}
 
 	/// Fold a packed cell and its style into concrete colours.
 	///
-	/// Order matters and follows what a terminal actually does: dim darkens the
-	/// foreground, *then* inverse swaps the two, *then* hidden blanks the
-	/// glyph. Applying inverse before dim would dim the background instead,
+	/// Order matters and follows what a terminal actually does: bold-as-bright
+	/// picks a different colour before any of the rest apply, dim darkens the
+	/// foreground *after* that, then inverse swaps the two, then hidden blanks
+	/// the glyph. Applying inverse before dim would dim the background instead,
 	/// which is the classic way inverted text ends up unreadable.
-	pub fn resolve(&self, cell: Square, styles: &[Style]) -> ResolvedCell {
+	pub fn resolve(&self, cell: Square, styles: &[Style], options: &GridOptions) -> ResolvedCell {
 		let style = styles
 			.get(cell.style_id() as usize)
 			.copied()
 			.unwrap_or_default();
 
-		let mut foreground = self.lookup(style.fg);
+		let fg = if options.bold_is_bright && style.flags.contains(StyleFlags::BOLD) {
+			bright(style.fg)
+		} else {
+			style.fg
+		};
+
+		let mut foreground = self.lookup(fg);
 		let background = self.lookup(style.bg);
 
 		if style.flags.contains(StyleFlags::DIM) {
-			foreground = dim(foreground);
+			foreground = foreground.dimmed();
 		}
 
 		let (foreground, background) = if style.flags.contains(StyleFlags::INVERSE) {
@@ -306,28 +332,16 @@ impl Palette {
 	}
 }
 
-/// The conventional two-thirds intensity for SGR 2.
+/// Map a colour onto the bright cut, the way `st` and `xterm` treat bold.
+///
+/// Only the eight base `NamedColor`s qualify — an already-light colour, an
+/// indexed colour and a truecolour `Spec` are left exactly as they were.
 #[inline]
-fn dim(color: Rgba) -> Rgba {
-	const NUMERATOR: u16 = 2;
-	const DENOMINATOR: u16 = 3;
-	let scale = |channel: u8| (channel as u16 * NUMERATOR / DENOMINATOR) as u8;
-	[scale(color[0]), scale(color[1]), scale(color[2]), color[3]]
-}
-
-/// `rio-vt` stores colours as `[f32; 4]` in 0..=1; the renderer and every
-/// encoder want bytes.
-#[inline]
-fn float_to_rgba(color: [f32; 4]) -> Rgba {
-	let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-	[
-		channel(color[0]),
-		channel(color[1]),
-		channel(color[2]),
-		// The table's alpha is a blend weight for the GPU path, not opacity;
-		// a captured cell is always fully opaque.
-		0xff,
-	]
+fn bright(color: AnsiColor) -> AnsiColor {
+	match color {
+		AnsiColor::Named(named) if (named as u8) < 8 => AnsiColor::Named(named.to_light()),
+		other => other,
+	}
 }
 
 #[cfg(test)]
@@ -368,10 +382,10 @@ mod tests {
 	#[test]
 	fn inverse_swaps_foreground_and_background() {
 		let (cell, styles) = styled(StyleFlags::INVERSE);
-		let resolved = Palette::default().resolve(cell, &styles);
+		let resolved = Palette::default().resolve(cell, &styles, &GridOptions::default());
 
-		assert_eq!(resolved.foreground, [10, 20, 30, 255]);
-		assert_eq!(resolved.background, [200, 100, 50, 255]);
+		assert_eq!(resolved.foreground, Color::rgb(10, 20, 30));
+		assert_eq!(resolved.background, Color::rgb(200, 100, 50));
 	}
 
 	/// Dim has to land on the foreground before inverse swaps the pair.
@@ -380,26 +394,68 @@ mod tests {
 	#[test]
 	fn dim_applies_before_inverse() {
 		let (cell, styles) = styled(StyleFlags::DIM | StyleFlags::INVERSE);
-		let resolved = Palette::default().resolve(cell, &styles);
+		let resolved = Palette::default().resolve(cell, &styles, &GridOptions::default());
 
-		assert_eq!(resolved.background, [133, 66, 33, 255]);
-		assert_eq!(resolved.foreground, [10, 20, 30, 255]);
+		assert_eq!(resolved.background, Color::rgb(133, 66, 33));
+		assert_eq!(resolved.foreground, Color::rgb(10, 20, 30));
 	}
 
 	#[test]
 	fn hidden_blanks_the_glyph_but_keeps_the_colours() {
 		let (cell, styles) = styled(StyleFlags::HIDDEN);
-		let resolved = Palette::default().resolve(cell, &styles);
+		let resolved = Palette::default().resolve(cell, &styles, &GridOptions::default());
 
 		assert_eq!(resolved.character, ' ');
-		assert_eq!(resolved.background, [10, 20, 30, 255]);
+		assert_eq!(resolved.background, Color::rgb(10, 20, 30));
 	}
 
 	#[test]
 	fn a_cell_with_no_style_entry_falls_back_to_the_default() {
-		let resolved = Palette::default().resolve(Square::from_char('q'), &[]);
+		let resolved =
+			Palette::default().resolve(Square::from_char('q'), &[], &GridOptions::default());
 		assert_eq!(resolved.character, 'q');
 		assert_eq!(resolved.flags, StyleFlags::empty());
+	}
+
+	/// `bold_is_bright` is the only thing that can change what `resolve`
+	/// hands back for the same cell and palette, so it needs its own case:
+	/// a bold ANSI red must land on the palette's bright red, while a
+	/// truecolour `Spec` — which names no ANSI slot to promote — must come
+	/// back untouched.
+	#[test]
+	fn bold_is_bright_promotes_named_colours_but_leaves_specs_alone() {
+		let style = Style {
+			fg: AnsiColor::Named(NamedColor::Red),
+			bg: AnsiColor::Named(NamedColor::Background),
+			underline_color: None,
+			flags: StyleFlags::BOLD,
+		};
+		let mut cell = Square::from_char('x');
+		cell.set_style_id(0);
+		let styles = vec![style];
+		let palette = Palette::default();
+		let bright = GridOptions {
+			bold_is_bright: true,
+		};
+
+		let resolved = palette.resolve(cell, &styles, &bright);
+		assert_eq!(resolved.foreground, palette.named(NamedColor::LightRed));
+
+		let spec_style = Style {
+			fg: AnsiColor::Spec(ColorRgb {
+				r: 10,
+				g: 20,
+				b: 30,
+			}),
+			..style
+		};
+		let spec_styles = vec![spec_style];
+		let resolved_spec = palette.resolve(cell, &spec_styles, &bright);
+		assert_eq!(resolved_spec.foreground, Color::rgb(10, 20, 30));
+
+		// With the option off, the same bold cell resolves to plain red.
+		let resolved_off = palette.resolve(cell, &styles, &GridOptions::default());
+		assert_eq!(resolved_off.foreground, palette.named(NamedColor::Red));
 	}
 
 	#[test]
