@@ -55,6 +55,19 @@ pub struct Surface {
 	pub margin_fill: Option<Color>,
 }
 
+/// The rectangle the panel occupies on the canvas, given the surface chrome
+/// and the canvas size. Shared by the paint pass so it does not duplicate the
+/// margin arithmetic.
+pub fn panel_rect(frame: &crate::geom::Frame, surface: &Surface) -> crate::geom::PixelRect {
+	let margin = surface.margin as f32;
+	crate::geom::PixelRect::new(
+		margin,
+		margin,
+		frame.canvas.0 as f32 - 2.0 * margin,
+		frame.canvas.1 as f32 - 2.0 * margin,
+	)
+}
+
 impl Default for Surface {
 	fn default() -> Self {
 		Self {

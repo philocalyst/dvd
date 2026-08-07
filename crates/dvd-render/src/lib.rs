@@ -21,6 +21,30 @@
 //! runtime; [`fearless_simd::Level::Fallback`] *is* the scalar version, compiled
 //! from the same source. The level is detected once and shared with `vello_cpu`,
 //! which re-exports the very same `fearless_simd::Level`.
+//!
+//! ## The paint pass
+//!
+//! Before the paint pass existed, `render.rs` and `encode/svg.rs` were two
+//! independent implementations of the same drawing — and they already disagreed.
+//! Now there is one reduction from the model to shapes, and two backends that
+//! receive it:
+//!
+//! ```text
+//! Snapshot ──resolve──▶ Grid ──diff──▶ Damage
+//!                       │
+//!                       ├── shape (Parley, row-cached) ──▶ GlyphRun
+//!                       │
+//!                       └── paint(grid, damage, shaper, &mut painter)
+//!                                   │
+//!                                   ├─▶ VelloPainter  ──▶ Pixmap ──▶ mp4 / png
+//!                                   ├─▶ SvgPainter    ──▶ markup
+//!                                   └─▶ RecordPainter ──▶ test assertions
+//! ```
+//!
+//! Parity is by construction: both backends receive identical `fill` /
+//! `glyphs` / `image` calls in identical order. The parity test then measures
+//! only what genuinely differs — rasterizer anti-aliasing versus resvg's —
+//! instead of measuring two independent implementations of terminal drawing.
 
 // Re-exported so `dvd` can name a colour, a level or a surface without taking
 // its own dependency on the exact versions this crate was built against — the
@@ -36,7 +60,10 @@ pub mod fonts;
 pub mod geom;
 pub mod grid;
 pub mod model;
+pub mod outline;
+pub mod paint;
 pub mod render;
 pub mod session;
+pub mod shape;
 pub mod simd;
 pub mod stream;

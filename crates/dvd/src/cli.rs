@@ -126,6 +126,8 @@ pub enum Commands {
 		/// Shell for recording
 		#[arg(short, long, default_value_t = default_shell())]
 		shell: String,
+		/// Output file (mp4, png, or svg)
+		output: PathBuf,
 	},
 
 	/// Play a tape file

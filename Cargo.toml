@@ -23,6 +23,15 @@ rustc-hash = "2.1"
 rio-vt = { version = "0.5.5", features = ["graphics"] }
 teletypewriter = "0.5.5"
 
+# `termwiz` provides a complete terminal state machine, PTY management, and
+# the ability to inherit the caller's own terminal state (colours, size,
+# shell) rather than starting from a blank slate. Used by `dvd record` so a
+# recording captures the user's actual terminal, not a synthetic one.
+# Its recording facilities — capturing the exact byte stream a PTY produces,
+# with timing — are modelled on asciinema's approach: a typescript plus a
+# wall-clock per write, so the recording can be played back at real speed.
+termwiz = "0.23"
+
 # Text. `parley` shapes (harfrust) and resolves fallback (fontique), `skrifa`
 # turns the chosen glyphs into outlines. Neither pulls `glifo`.
 parley = "0.11"

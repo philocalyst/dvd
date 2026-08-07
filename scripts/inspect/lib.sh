@@ -36,6 +36,15 @@ repo_root() {
 	cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd
 }
 
+# ImageMagick, vhs and other tools on this machine live in Homebrew's
+# prefix, which a Nix-managed PATH may not include. Add it unconditionally
+# rather than requiring the caller to fix their environment first.
+case ":${PATH:-}:" in
+	*/opt/homebrew/bin:*) ;;
+	*) PATH="/opt/homebrew/bin:$PATH" ;;
+esac
+export PATH
+
 ROOT="$(repo_root)"
 OUT="$ROOT/inspect-out"
 TAPE_DVD="$ROOT/tests/tapes/macchina.dvd"

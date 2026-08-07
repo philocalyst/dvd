@@ -9,6 +9,7 @@ pub mod cli;
 pub mod tape;
 
 mod burn;
+mod record;
 mod theme;
 
 use std::process::ExitCode;
@@ -18,9 +19,9 @@ pub fn run(cli: cli::Cli) -> ExitCode {
 		cli::Commands::Check { files } => check(files),
 		cli::Commands::Burn(args) => burn::burn(args),
 		cli::Commands::Themes { markdown } => themes(*markdown),
-		cli::Commands::Record { .. } | cli::Commands::Play { .. } | cli::Commands::New { .. } => {
-			Err(anyhow::anyhow!("not wired up yet in this rebuild"))
-		}
+		cli::Commands::Record { shell, output } => record::record(shell, output.clone()),
+		cli::Commands::Play { .. } => Err(anyhow::anyhow!("play is not yet implemented")),
+		cli::Commands::New { .. } => Err(anyhow::anyhow!("new is not yet implemented")),
 	};
 
 	match result {
