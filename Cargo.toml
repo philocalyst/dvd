@@ -11,6 +11,8 @@ license = "MIT"
 anyhow = "1"
 rayon = "1"
 rustc-hash = "2.1"
+crossbeam = "0.8"
+subsetter = "0.2"
 
 # The terminal core. Everything about VT state, the grid, and the PTY comes
 # from here; `dvd` owns no escape-sequence logic of its own.

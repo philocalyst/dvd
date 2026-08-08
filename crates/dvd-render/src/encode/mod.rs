@@ -8,6 +8,7 @@
 //! What they share is this module: the one pass that turns a `vello_cpu`
 //! [`Pixmap`] into the straight RGBA every encoder actually wants.
 
+mod font_embed;
 mod h264;
 pub mod mp4;
 pub mod png;

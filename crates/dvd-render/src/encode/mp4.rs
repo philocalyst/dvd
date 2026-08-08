@@ -48,7 +48,7 @@ use mp4::{AvcConfig, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig, 
 
 use super::h264;
 use crate::geom::Color;
-use crate::stream::{Ctx, Meta, Sink};
+use crate::stream::{Context as StreamContext, Metadata, Sink};
 
 /// The macroblock edge every plane dimension is rounded up to.
 const MACROBLOCK: u32 = 16;
@@ -193,11 +193,11 @@ fn length_prefixed(nal: &[u8]) -> Vec<u8> {
 }
 
 impl Sink for Mp4 {
-	fn wants_pixels(&self) -> bool {
+	fn requires_pixels(&self) -> bool {
 		true
 	}
 
-	fn begin(&mut self, meta: &Meta) -> Result<()> {
+	fn begin(&mut self, meta: &Metadata) -> Result<()> {
 		// `less-avc` refuses an odd width outright, and an odd height would put
 		// the chroma planes half a row out. The renderer already rounds its
 		// canvas to an even size for exactly this reason; this is the check that
@@ -237,7 +237,7 @@ impl Sink for Mp4 {
 		Ok(())
 	}
 
-	fn accept(&mut self, ctx: Ctx<'_>) -> Result<()> {
+	fn accept(&mut self, ctx: StreamContext<'_>) -> Result<()> {
 		let Some(pixels) = ctx.pixels else {
 			return Ok(());
 		};
@@ -343,7 +343,7 @@ impl Sink for Mp4 {
 
 		let sample = length_prefixed(&nal);
 
-		let duration = ctx.frame.hold.max(1) * TICKS_PER_FRAME;
+		let duration = ctx.frame.hold_ticks.max(1) * TICKS_PER_FRAME;
 		let writer = self
 			.writer
 			.as_mut()
@@ -465,13 +465,13 @@ mod verification {
 	) -> Result<()> {
 		let mut sink =
 			Mp4::new(path.to_path_buf(), Level::new(), Color::BLACK).with_profile(profile);
-		sink.begin(&Meta {
+		sink.begin(&Metadata {
 			width,
 			height,
 			frames_per_second: 50,
 		})?;
 
-		// The sink never reads the snapshot for a pixel frame — see `Ctx`'s
+		// The sink never reads the snapshot for a pixel frame — see `Context`'s
 		// doc in `stream.rs` — so an empty one shared across every frame
 		// costs nothing and changes nothing about what is being tested.
 		let snapshot = Arc::new(Snapshot::new(1, 1));
@@ -487,7 +487,7 @@ mod verification {
 			}
 
 			let frame = Frame::new(Arc::clone(&snapshot), 1);
-			sink.accept(Ctx {
+			sink.accept(StreamContext {
 				frame: &frame,
 				pixels: Some(&pixmap),
 			})?;

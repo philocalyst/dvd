@@ -9,6 +9,7 @@ description = "Terminal session capture, frame dedup, rendering and encoding for
 anyhow.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
+crossbeam.workspace = true
 
 rio-vt.workspace = true
 teletypewriter.workspace = true
@@ -27,6 +28,7 @@ base64.workspace = true
 flate2.workspace = true
 corcovado = "0.5.5"
 rio-graphics = "0.5.5"
+subsetter.workspace = true
 
 [dev-dependencies]
 # On a target with NEON or AVX, `dispatch!` prunes the fallback arm entirely —

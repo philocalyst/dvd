@@ -15,6 +15,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
@@ -71,6 +72,11 @@ struct Signals {
 #[derive(Clone, Default)]
 struct Listener {
 	signals: Arc<Signals>,
+	/// Where `RioEvent::PtyWrite` goes back in. `None` until `Session::open`
+	/// finishes constructing `Machine` and fills it in — the channel does not
+	/// exist yet when `Crosswords` and `Machine` are handed their listener,
+	/// so this starts empty and is set once, right before `machine.spawn()`.
+	to_pty: Arc<OnceLock<corcovado::channel::Sender<Msg>>>,
 }
 
 impl EventListener for Listener {
@@ -85,6 +91,21 @@ impl EventListener for Listener {
 			}
 			RioEvent::UpdateGraphics { .. } => {
 				self.signals.graphics_pending.store(true, Ordering::Release);
+			}
+			// `Crosswords` answers terminal queries (cursor position reports,
+			// device attributes, and the like) by computing the reply and
+			// handing it back as this event, expecting *something* to put it
+			// on the wire to the child — it does not write to the PTY itself.
+			// Dropping this silently, as the old catch-all here did, means
+			// any program that asks one of these questions and blocks on the
+			// answer hangs forever: it is not "slow to start", it is waiting
+			// on a reply that will never come. `nu`'s reedline is one such
+			// program — it probes cursor position at startup and hung
+			// indefinitely under the previous version of this listener.
+			RioEvent::PtyWrite(_route, text) => {
+				if let Some(to_pty) = self.to_pty.get() {
+					let _ = to_pty.send(Msg::Input(text.into_bytes().into()));
+				}
 			}
 			_ => {}
 		}
@@ -150,9 +171,19 @@ impl Session {
 		)
 		.with_context(|| format!("opening a pty for {shell}"))?;
 
+		// `listener` is about to move into `Machine::new`; keep a handle to its
+		// `to_pty` slot so it can be filled in once the channel exists below.
+		let to_pty_slot = Arc::clone(&listener.to_pty);
+
 		let machine = Machine::new(Arc::clone(&terminal), pty, listener, window(), ROUTE)
 			.map_err(|error| anyhow::anyhow!("starting the pty reader: {error}"))?;
 		let to_pty = machine.channel();
+		// Every clone of `listener` (this one, and the one `Crosswords` above
+		// was given) shares this `Arc`, so one `set` reaches both — and it has
+		// to happen before `spawn()`, or a query the child sends in its very
+		// first burst of output could be answered before anything is
+		// listening for the reply.
+		let _ = to_pty_slot.set(to_pty.clone());
 		machine.spawn();
 
 		Ok(Self {
@@ -172,6 +203,43 @@ impl Session {
 		self.to_pty
 			.send(Msg::Input(bytes.into()))
 			.map_err(|_| anyhow::anyhow!("the pty reader has stopped"))
+	}
+
+	/// Feed bytes straight into the VT parser, as if the child had emitted
+	/// them, without the child ever seeing them.
+	///
+	/// `write` puts bytes on the *input* side of the PTY — indistinguishable
+	/// from a keystroke to whatever line editor the child is running. That is
+	/// correct for `Type`/`Key`/etc, which are meant to reach the child. It is
+	/// wrong for escape sequences the recorder applies to the terminal model
+	/// itself (cursor blink, cursor style): a shell's readline reads a raw ESC
+	/// as a meta-key prefix and can splice the remaining bytes into whatever
+	/// the child types next (the `CursorBlink` gotcha in `AGENTS.md`).
+	/// Advancing the parser directly updates `Crosswords` the same way real
+	/// terminal output would, with no PTY round trip and nothing for a line
+	/// editor to misinterpret.
+	pub fn feed(&self, bytes: &[u8]) {
+		let mut terminal = self.terminal.lock();
+		let mut processor = rio_vt::performer::handler::Processor::default();
+		processor.advance(&mut *terminal, bytes);
+	}
+
+	/// Whether the cursor currently sits on a row the shell itself marked as
+	/// a prompt, via OSC 133 (`ESC ] 133 ; A`) shell integration.
+	///
+	/// This is the terminal-native signal real terminal emulators (Ghostty,
+	/// iTerm2, kitty, VS Code) use to know a command has finished and the
+	/// shell is showing its own prompt again — the same signal that drives
+	/// their finished-command bell. It is unambiguous where the shell emits
+	/// it: a mark the shell itself set on its own prompt row, not a guess
+	/// about what prompt text looks like. `Crosswords` already parses OSC
+	/// 133 into `Row::semantic_prompt`; this just reads it back.
+	pub fn cursor_row_is_prompt(&self) -> bool {
+		use rio_vt::crosswords::grid::row::SemanticPrompt;
+
+		let terminal = self.terminal.lock();
+		let row = terminal.cursor().pos.row;
+		terminal.grid[row].semantic_prompt != SemanticPrompt::None
 	}
 
 	/// Whether the child process has exited.

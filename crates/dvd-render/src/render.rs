@@ -42,6 +42,20 @@ use crate::grid::GridOptions;
 use crate::model::{Palette, Snapshot};
 use crate::stream::Rasterizer;
 
+// --- Constants (Magic Numbers Extracted) ---
+const DEFAULT_SURFACE_MARGIN: u32 = 0;
+const DEFAULT_SURFACE_PADDING: u32 = 24;
+const DEFAULT_BORDER_RADIUS: u32 = 12;
+
+const PATH_TOLERANCE: f64 = 0.1;
+const DEFAULT_SCALE: f32 = 1.0;
+const CURSOR_THICKNESS_MULTIPLIER: f64 = 1.5;
+const MINIMUM_CURSOR_THICKNESS: f64 = 2.0;
+
+const WIDE_CHARACTER_SPAN: u16 = 2;
+const SINGLE_CHARACTER_SPAN: u16 = 1;
+const FALLBACK_CHARACTER: char = ' ';
+
 /// How the terminal panel sits on the canvas.
 #[derive(Clone, Copy, Debug)]
 pub struct Surface {
@@ -55,6 +69,19 @@ pub struct Surface {
 	pub margin_fill: Option<Color>,
 }
 
+impl Default for Surface {
+	fn default() -> Self {
+		Self {
+			margin: DEFAULT_SURFACE_MARGIN,
+			padding: DEFAULT_SURFACE_PADDING,
+			// Rounded by default: the corners fall outside the panel fill, so a
+			// recording composites onto a page instead of sitting in a hard box.
+			border_radius: DEFAULT_BORDER_RADIUS,
+			margin_fill: None,
+		}
+	}
+}
+
 /// The rectangle the panel occupies on the canvas, given the surface chrome
 /// and the canvas size. Shared by the paint pass so it does not duplicate the
 /// margin arithmetic.
@@ -66,19 +93,6 @@ pub fn panel_rect(frame: &crate::geom::Frame, surface: &Surface) -> crate::geom:
 		frame.canvas.0 as f32 - 2.0 * margin,
 		frame.canvas.1 as f32 - 2.0 * margin,
 	)
-}
-
-impl Default for Surface {
-	fn default() -> Self {
-		Self {
-			margin: 0,
-			padding: 24,
-			// Rounded by default: the corners fall outside the panel fill, so a
-			// recording composites onto a page instead of sitting in a hard box.
-			border_radius: 12,
-			margin_fill: None,
-		}
-	}
 }
 
 /// Identifies a cached outline. The render size never changes over a
@@ -96,36 +110,49 @@ struct PathPen {
 }
 
 impl OutlinePen for PathPen {
-	fn move_to(&mut self, x: f32, y: f32) {
-		self.path.move_to((x as f64, -y as f64));
+	fn move_to(&mut self, point_x: f32, point_y: f32) {
+		self.path.move_to((point_x as f64, -point_y as f64));
 	}
-	fn line_to(&mut self, x: f32, y: f32) {
-		self.path.line_to((x as f64, -y as f64));
+
+	fn line_to(&mut self, point_x: f32, point_y: f32) {
+		self.path.line_to((point_x as f64, -point_y as f64));
 	}
-	fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
-		self.path
-			.quad_to((cx as f64, -cy as f64), (x as f64, -y as f64));
-	}
-	fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
-		self.path.curve_to(
-			(cx0 as f64, -cy0 as f64),
-			(cx1 as f64, -cy1 as f64),
-			(x as f64, -y as f64),
+
+	fn quad_to(&mut self, control_x: f32, control_y: f32, point_x: f32, point_y: f32) {
+		self.path.quad_to(
+			(control_x as f64, -control_y as f64),
+			(point_x as f64, -point_y as f64),
 		);
 	}
+
+	fn curve_to(
+		&mut self,
+		control_x0: f32,
+		control_y0: f32,
+		control_x1: f32,
+		control_y1: f32,
+		point_x: f32,
+		point_y: f32,
+	) {
+		self.path.curve_to(
+			(control_x0 as f64, -control_y0 as f64),
+			(control_x1 as f64, -control_y1 as f64),
+			(point_x as f64, -point_y as f64),
+		);
+	}
+
 	fn close(&mut self) {
 		self.path.close_path();
 	}
 }
 
 /// One glyph, already pinned to its column.
-struct Placed {
+struct PlacedGlyph {
 	key: GlyphKey,
 	/// Pen position in grid pixels.
-	x: f32,
-	y: f32,
-	/// Uniform scale for the outline. Almost always 1.0 — see
-	/// [`Renderer::shape_row`] for the fallback glyph that is not.
+	horizontal_offset: f32,
+	vertical_offset: f32,
+	/// Uniform scale for the outline.
 	scale: f32,
 	column: u16,
 }
@@ -155,7 +182,7 @@ pub struct Renderer {
 	row_text: String,
 	/// Byte offset in `row_text` for the start of each column's character.
 	column_of_byte: Vec<u16>,
-	placed: Vec<Placed>,
+	placed: Vec<PlacedGlyph>,
 	layout: Layout<[u8; 4]>,
 }
 
@@ -170,17 +197,17 @@ impl Renderer {
 		level: Level,
 	) -> Result<Self> {
 		let metrics = fonts.metrics;
-		let chrome = 2 * (surface.margin + surface.padding);
+		let chrome_size = 2 * (surface.margin + surface.padding);
 
 		// Rounded up to an even size. H.264 subsamples chroma 2x2 and refuses an
 		// odd width outright, so an odd canvas would mean either no video output
 		// or a video a pixel narrower than the still beside it. One column of
 		// background is a cheaper price than two outputs that disagree.
-		let even = |value: u32| (value + 1) & !1;
-		let width =
-			even(columns as u32 * metrics.cell_width + chrome).min(u16::MAX as u32 - 1) as u16;
-		let height =
-			even(screen_rows as u32 * metrics.cell_height + chrome).min(u16::MAX as u32 - 1) as u16;
+		let width = Self::round_up_to_even(columns as u32 * metrics.cell_width + chrome_size)
+			.min(u16::MAX as u32 - 1) as u16;
+
+		let height = Self::round_up_to_even(screen_rows as u32 * metrics.cell_height + chrome_size)
+			.min(u16::MAX as u32 - 1) as u16;
 
 		let inset = (surface.margin + surface.padding) as f64;
 
@@ -198,9 +225,6 @@ impl Renderer {
 			.collect();
 
 		Ok(Self {
-			// The level is the one detected once for the whole process and
-			// shared with our own kernels — `vello_cpu` re-exports the very
-			// same `fearless_simd::Level`.
 			context: RenderContext::new_with(
 				width,
 				height,
@@ -227,6 +251,11 @@ impl Renderer {
 		})
 	}
 
+	#[inline]
+	fn round_up_to_even(value: u32) -> u32 {
+		(value + 1) & !1
+	}
+
 	pub fn metrics(&self) -> Metrics {
 		self.fonts.metrics
 	}
@@ -241,86 +270,90 @@ impl Renderer {
 
 	/// Draw the panel the grid sits on.
 	fn draw_surface(&mut self) {
-		if let Some(fill) = self.surface.margin_fill {
-			self.context.set_paint(Self::paint(fill));
+		if let Some(fill_color) = self.surface.margin_fill {
+			self.context.set_paint(Self::paint(fill_color));
 			self.context
 				.fill_rect(&Rect::new(0.0, 0.0, self.width as f64, self.height as f64));
 		}
 
-		let margin = self.surface.margin as f64;
-		let panel = Rect::new(
-			margin,
-			margin,
-			self.width as f64 - margin,
-			self.height as f64 - margin,
+		let margin_offset = self.surface.margin as f64;
+		let panel_rectangle = Rect::new(
+			margin_offset,
+			margin_offset,
+			self.width as f64 - margin_offset,
+			self.height as f64 - margin_offset,
 		);
 
-		self.context.set_paint(Self::paint(
-			self.palette
-				.named(rio_vt::config::colors::NamedColor::Background),
-		));
+		let background_color = self
+			.palette
+			.named(rio_vt::config::colors::NamedColor::Background);
+		self.context.set_paint(Self::paint(background_color));
 
 		if self.surface.border_radius > 0 {
-			let rounded = RoundedRect::from_rect(panel, self.surface.border_radius as f64);
-			self.context.fill_path(&rounded.to_path(0.1));
+			let rounded_panel =
+				RoundedRect::from_rect(panel_rectangle, self.surface.border_radius as f64);
+			self.context
+				.fill_path(&rounded_panel.to_path(PATH_TOLERANCE));
 		} else {
-			self.context.fill_rect(&panel);
+			self.context.fill_rect(&panel_rectangle);
 		}
 	}
 
 	/// Fill cell backgrounds, merging horizontal runs of one colour.
-	///
-	/// Runs rather than per-cell rectangles because a terminal row is mostly one
-	/// colour: an eighty-column row of default background is one rectangle
-	/// instead of eighty, and the rasterizer sees a fraction of the edges.
 	fn draw_backgrounds(&mut self, snapshot: &Snapshot) {
-		let metrics = self.fonts.metrics;
-		let background = self
+		let default_background = self
 			.palette
 			.named(rio_vt::config::colors::NamedColor::Background);
-
 		let options = GridOptions::default();
 
 		for row in 0..snapshot.screen_rows {
-			let mut run_start = 0u16;
-			let mut run_color = self
-				.palette
-				.resolve(snapshot.cell(0, row), &snapshot.styles, &options)
-				.background;
+			let mut current_run_start = 0u16;
+			let mut current_run_color = self.resolve_cell_background(snapshot, 0, row, &options);
 
 			for column in 1..=snapshot.columns {
-				let color = if column == snapshot.columns {
-					// Sentinel that always differs, to flush the final run.
-					Color::TRANSPARENT
+				let next_color = if column == snapshot.columns {
+					Color::TRANSPARENT // Sentinel to flush the final run.
 				} else {
-					self.palette
-						.resolve(snapshot.cell(column, row), &snapshot.styles, &options)
-						.background
+					self.resolve_cell_background(snapshot, column, row, &options)
 				};
 
-				if color != run_color {
-					// The panel is already this colour, so painting it again
-					// would be a rectangle that changes nothing.
-					if run_color != background {
-						self.fill_cells(run_start, column, row, run_color, metrics);
+				if next_color != current_run_color {
+					if current_run_color != default_background {
+						self.fill_cell_range(current_run_start, column, row, current_run_color);
 					}
-					run_start = column;
-					run_color = color;
+					current_run_start = column;
+					current_run_color = next_color;
 				}
 			}
 		}
 	}
 
-	fn fill_cells(&mut self, from: u16, to: u16, row: u16, color: Color, metrics: Metrics) {
+	#[inline]
+	fn resolve_cell_background(
+		&self,
+		snapshot: &Snapshot,
+		column: u16,
+		row: u16,
+		options: &GridOptions,
+	) -> Color {
+		self.palette
+			.resolve(snapshot.cell(column, row), &snapshot.styles, options)
+			.background
+	}
+
+	fn fill_cell_range(&mut self, start_column: u16, end_column: u16, row: u16, color: Color) {
 		let (origin_x, origin_y) = self.origin;
-		let rect = Rect::new(
-			origin_x + (from as u32 * metrics.cell_width) as f64,
-			origin_y + (row as u32 * metrics.cell_height) as f64,
-			origin_x + (to as u32 * metrics.cell_width) as f64,
-			origin_y + ((row as u32 + 1) * metrics.cell_height) as f64,
-		);
+		let metrics = self.fonts.metrics;
+
+		let start_x = origin_x + (start_column as u32 * metrics.cell_width) as f64;
+		let start_y = origin_y + (row as u32 * metrics.cell_height) as f64;
+		let end_x = origin_x + (end_column as u32 * metrics.cell_width) as f64;
+		let end_y = origin_y + ((row as u32 + 1) * metrics.cell_height) as f64;
+
+		let fill_rectangle = Rect::new(start_x, start_y, end_x, end_y);
+
 		self.context.set_paint(Self::paint(color));
-		self.context.fill_rect(&rect);
+		self.context.fill_rect(&fill_rectangle);
 	}
 
 	/// Shape one row and pin every cluster back to its source column.
@@ -329,65 +362,69 @@ impl Renderer {
 		self.column_of_byte.clear();
 		self.placed.clear();
 
-		for column in 0..snapshot.columns {
-			let cell = snapshot.cell(column, row);
-			// A wide character's trailing spacer holds no character of its own;
-			// emitting it would draw the same glyph again one column right.
-			if cell.wide() == Wide::Spacer {
-				continue;
-			}
-			let resolved = self
-				.palette
-				.resolve(cell, &snapshot.styles, &GridOptions::default());
-			let character = match resolved.character {
-				'\0' => ' ',
-				other => other,
-			};
-
-			let start = self.row_text.len();
-			self.row_text.push(character);
-			self.column_of_byte.resize(self.row_text.len(), column);
-			debug_assert!(self.column_of_byte.len() > start);
-
-			// Combining marks do not fit in the packed cell, so `rio-vt` parks
-			// them out of line in `extras`. Appending them to the same column
-			// hands the base and its marks to the shaper as one cluster, which
-			// is what stacks an accent on its letter instead of dropping it.
-			// A hidden cell has already resolved to a space and gets none.
-			if !resolved.flags.contains(StyleFlags::HIDDEN) {
-				let marks = cell
-					.extras_id()
-					.and_then(|id| snapshot.extras.get(&id))
-					.map(|extras| extras.zerowidth.as_slice())
-					.unwrap_or_default();
-
-				for mark in marks {
-					self.row_text.push(*mark);
-					self.column_of_byte.resize(self.row_text.len(), column);
-				}
-			}
-		}
+		self.build_text_string(snapshot, row);
 
 		if self.row_text.trim().is_empty() {
 			return;
 		}
 
-		let mut builder =
-			self.layout_context
-				.ranged_builder(&mut self.fonts.context, &self.row_text, 1.0, false);
+		self.layout_text();
+		self.place_glyphs(snapshot, row);
+	}
+
+	fn build_text_string(&mut self, snapshot: &Snapshot, row: u16) {
+		let options = GridOptions::default();
+
+		for column in 0..snapshot.columns {
+			let cell = snapshot.cell(column, row);
+
+			if cell.wide() == Wide::Spacer {
+				continue;
+			}
+
+			let resolved_style = self.palette.resolve(cell, &snapshot.styles, &options);
+			let character = match resolved_style.character {
+				'\0' => FALLBACK_CHARACTER,
+				valid_character => valid_character,
+			};
+
+			self.row_text.push(character);
+			self.column_of_byte.resize(self.row_text.len(), column);
+
+			if !resolved_style.flags.contains(StyleFlags::HIDDEN) {
+				if let Some(extras_id) = cell.extras_id() {
+					if let Some(extras) = snapshot.extras.get(&extras_id) {
+						for mark in extras.zerowidth.as_slice() {
+							self.row_text.push(*mark);
+							self.column_of_byte.resize(self.row_text.len(), column);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	fn layout_text(&mut self) {
+		let mut builder = self.layout_context.ranged_builder(
+			&mut self.fonts.context,
+			&self.row_text,
+			DEFAULT_SCALE,
+			false,
+		);
+
 		builder.push_default(StyleProperty::FontFamily(FontFamily::List(
 			std::borrow::Cow::Borrowed(&self.families),
 		)));
 		builder.push_default(StyleProperty::FontSize(self.fonts.size));
 		builder.build_into(&mut self.layout, &self.row_text);
 
-		// No width constraint, so nothing actually breaks — this only groups the
-		// runs into a line so they can be walked. It is also why the
-		// dictionary-based segmenter behind Parley's `complex-scripts` feature
-		// is not needed: the grid decides where lines end, never the text.
+		// No width constraint, grid decides where lines end.
 		self.layout.break_all_lines(None);
+	}
 
+	fn place_glyphs(&mut self, snapshot: &Snapshot, row: u16) {
 		let metrics = self.fonts.metrics;
+
 		for line in self.layout.lines() {
 			for run in line.runs() {
 				let font = run.font();
@@ -395,65 +432,37 @@ impl Renderer {
 				self.faces.entry(font_key).or_insert_with(|| font.clone());
 
 				for cluster in run.clusters() {
-					// This is the pin. The cluster knows which bytes of the row
-					// it came from; those bytes know which column they were
-					// typed in. Visual order within the run is Parley's
-					// business — including the reversal for RTL — but the
-					// anchor is always the terminal's own column.
 					let column = self
 						.column_of_byte
 						.get(cluster.text_range().start)
 						.copied()
 						.unwrap_or(0);
 
-					let cell_x = (column as u32 * metrics.cell_width) as f32;
+					let cell_horizontal_offset = (column as u32 * metrics.cell_width) as f32;
 
-					// How much room the terminal gave this character. A wide
-					// character owns its trailing spacer, so it gets two cells.
 					let span = match snapshot.cell(column, row).wide() {
-						Wide::Wide => 2,
-						_ => 1,
+						Wide::Wide => WIDE_CHARACTER_SPAN,
+						_ => SINGLE_CHARACTER_SPAN,
 					};
-					let span_width = (span * metrics.cell_width) as f32;
+					let span_width = (span as u32 * metrics.cell_width) as f32;
 
-					// The primary face was measured to fit the cell exactly, so
-					// for ordinary text this is 1.0 and the offset is a fraction
-					// of a pixel. Fallback faces were measured against nothing:
-					// a colour emoji advances an em and a half, and drawn at
-					// native size it would paint over the two columns to its
-					// right. Scaling to the span the terminal assigned is what
-					// keeps the grid a grid. It is uniform so the glyph is
-					// shrunk rather than squashed, and what is left over is
-					// split evenly so a narrow fallback glyph sits centred in
-					// its cell rather than jammed against the left edge.
-					//
-					// The width comes from the glyphs rather than from
-					// `Cluster::advance`, which spreads a composition evenly
-					// over the clusters that fed it: `e` followed by a combining
-					// acute is one `é` glyph advancing a full cell, but two
-					// clusters each claiming half of it. Believing that would
-					// centre every composed character against half its real
-					// width and nudge it to the right.
 					let advance: f32 = cluster.glyphs().map(|glyph| glyph.advance).sum();
 					let scale = if advance > span_width && advance > 0.0 {
 						span_width / advance
 					} else {
-						1.0
+						DEFAULT_SCALE
 					};
+
 					let centering = (span_width - advance * scale).max(0.0) / 2.0;
 
 					for glyph in cluster.glyphs() {
-						self.placed.push(Placed {
+						self.placed.push(PlacedGlyph {
 							key: GlyphKey {
 								font: font_key,
 								glyph: glyph.id,
 							},
-							// `glyph.x` carries the offset *within* the cluster,
-							// which is what stacks a combining mark on its base
-							// rather than beside it — so it scales with the
-							// cluster it belongs to.
-							x: cell_x + centering + glyph.x * scale,
-							y: metrics.baseline + glyph.y * scale,
+							horizontal_offset: cell_horizontal_offset + centering + glyph.x * scale,
+							vertical_offset: metrics.baseline + glyph.y * scale,
 							scale,
 							column,
 						});
@@ -466,20 +475,15 @@ impl Renderer {
 	/// Fetch a glyph outline, extracting it only the first time it is seen.
 	fn outline(&mut self, key: GlyphKey) -> Option<&BezPath> {
 		if !self.outlines.contains_key(&key) {
-			let path = self.extract_outline(key)?;
-			self.outlines.insert(key, path);
+			if let Some(path) = self.extract_outline(key) {
+				self.outlines.insert(key, path);
+			}
 		}
 		self.outlines.get(&key)
 	}
 
 	fn extract_outline(&mut self, key: GlyphKey) -> Option<BezPath> {
-		// Every face shaping has ever chosen was recorded as the row was shaped,
-		// so the blob this glyph came from is one lookup away. Walking the
-		// layout for it instead would also work, but only for glyphs belonging
-		// to the row still in the layout — and it would rescan every run for
-		// every glyph of every row.
 		let font_data = self.faces.get(&key.font)?.clone();
-
 		let font = FontRef::from_index(font_data.data.as_ref(), font_data.index).ok()?;
 		let outlines = font.outline_glyphs();
 		let glyph = outlines.get(GlyphId::from(key.glyph))?;
@@ -495,38 +499,34 @@ impl Renderer {
 		Some(pen.path)
 	}
 
-	/// Draw one row's glyphs, plus the underline and strikethrough that go with
-	/// them.
+	/// Draw one row's glyphs, plus the underline and strikethrough that go with them.
 	fn draw_row_text(&mut self, snapshot: &Snapshot, row: u16) {
 		self.shape_row(snapshot, row);
 
 		let metrics = self.fonts.metrics;
 		let (origin_x, origin_y) = self.origin;
-		let row_y = origin_y + (row as u32 * metrics.cell_height) as f64;
+		let row_vertical_offset = origin_y + (row as u32 * metrics.cell_height) as f64;
+		let options = GridOptions::default();
 
-		// Taken out so the borrow of `self.placed` ends before `outline` needs
-		// `&mut self`.
-		let placed = std::mem::take(&mut self.placed);
+		// Taken out so the borrow of `self.placed` ends before `outline` needs `&mut self`.
+		let placed_glyphs = std::mem::take(&mut self.placed);
 
-		for glyph in &placed {
-			let resolved = self.palette.resolve(
-				snapshot.cell(glyph.column, row),
-				&snapshot.styles,
-				&GridOptions::default(),
-			);
+		for glyph in &placed_glyphs {
+			let resolved_style =
+				self.palette
+					.resolve(snapshot.cell(glyph.column, row), &snapshot.styles, &options);
 
-			// A hidden cell resolves to a space, which has no outline anyway;
-			// skipping early avoids the cache lookup.
-			if resolved.flags.contains(StyleFlags::HIDDEN) {
+			if resolved_style.flags.contains(StyleFlags::HIDDEN) {
 				continue;
 			}
 
-			let color = self.cell_foreground(snapshot, glyph.column, row, resolved.foreground);
-			// Scale first, then translate: the outline is cached at its own
-			// origin, so scaling after the move would drag the glyph toward the
-			// top-left of the canvas by the same factor.
-			let transform = Affine::translate((origin_x + glyph.x as f64, row_y + glyph.y as f64))
-				* Affine::scale(glyph.scale as f64);
+			let color =
+				self.cell_foreground(snapshot, glyph.column, row, resolved_style.foreground);
+			let absolute_x = origin_x + glyph.horizontal_offset as f64;
+			let absolute_y = row_vertical_offset + glyph.vertical_offset as f64;
+
+			let transform =
+				Affine::translate((absolute_x, absolute_y)) * Affine::scale(glyph.scale as f64);
 
 			if let Some(path) = self.outline(glyph.key) {
 				let path = path.clone();
@@ -537,61 +537,59 @@ impl Renderer {
 			}
 		}
 
-		self.placed = placed;
-
+		self.placed = placed_glyphs;
 		self.draw_decorations(snapshot, row);
 	}
 
-	/// Underlines and strikethroughs, drawn as rectangles.
-	///
-	/// Rectangles rather than the font's own decoration glyphs because a run
-	/// spanning several cells has to be continuous across them, and because the
-	/// thickness has to land on whole pixels to stay crisp at recording sizes.
 	fn draw_decorations(&mut self, snapshot: &Snapshot, row: u16) {
 		let metrics = self.fonts.metrics;
 		let (origin_x, origin_y) = self.origin;
-		let row_y = origin_y + (row as u32 * metrics.cell_height) as f64;
+		let row_vertical_offset = origin_y + (row as u32 * metrics.cell_height) as f64;
+		let options = GridOptions::default();
 
 		for column in 0..snapshot.columns {
-			let resolved = self.palette.resolve(
-				snapshot.cell(column, row),
-				&snapshot.styles,
-				&GridOptions::default(),
-			);
+			let resolved_style =
+				self.palette
+					.resolve(snapshot.cell(column, row), &snapshot.styles, &options);
 
-			let x0 = origin_x + (column as u32 * metrics.cell_width) as f64;
-			let x1 = x0 + metrics.cell_width as f64;
-			let color = resolved.underline.unwrap_or(resolved.foreground);
+			if !resolved_style
+				.flags
+				.intersects(StyleFlags::ALL_UNDERLINES | StyleFlags::STRIKEOUT)
+			{
+				continue; // Skip early if no decorations are needed
+			}
 
-			if resolved.flags.intersects(StyleFlags::ALL_UNDERLINES) {
-				let top = row_y + metrics.underline_offset as f64;
-				self.context.set_paint(Self::paint(color));
+			let start_x = origin_x + (column as u32 * metrics.cell_width) as f64;
+			let end_x = start_x + metrics.cell_width as f64;
+			let decoration_color = resolved_style
+				.underline
+				.unwrap_or(resolved_style.foreground);
+
+			if resolved_style.flags.intersects(StyleFlags::ALL_UNDERLINES) {
+				let underline_top = row_vertical_offset + metrics.underline_offset as f64;
+				self.context.set_paint(Self::paint(decoration_color));
 				self.context.fill_rect(&Rect::new(
-					x0,
-					top,
-					x1,
-					top + metrics.underline_thickness as f64,
+					start_x,
+					underline_top,
+					end_x,
+					underline_top + metrics.underline_thickness as f64,
 				));
 			}
 
-			if resolved.flags.contains(StyleFlags::STRIKEOUT) {
-				let top = row_y + metrics.strikeout_offset as f64;
-				self.context.set_paint(Self::paint(resolved.foreground));
+			if resolved_style.flags.contains(StyleFlags::STRIKEOUT) {
+				let strikeout_top = row_vertical_offset + metrics.strikeout_offset as f64;
+				self.context
+					.set_paint(Self::paint(resolved_style.foreground));
 				self.context.fill_rect(&Rect::new(
-					x0,
-					top,
-					x1,
-					top + metrics.strikeout_thickness as f64,
+					start_x,
+					strikeout_top,
+					end_x,
+					strikeout_top + metrics.strikeout_thickness as f64,
 				));
 			}
 		}
 	}
 
-	/// The colour a glyph is drawn in, accounting for the cursor sitting on it.
-	///
-	/// A block cursor paints over the cell, so the glyph underneath has to be
-	/// re-coloured or it disappears into the cursor. Picking by luma rather than
-	/// inverting the cell keeps the character legible against any cursor colour.
 	fn cell_foreground(
 		&self,
 		snapshot: &Snapshot,
@@ -611,8 +609,8 @@ impl Renderer {
 	fn cursor_covers(&self, snapshot: &Snapshot, column: u16, row: u16) -> bool {
 		snapshot.cursor_visible
 			&& snapshot.cursor.content == CursorShape::Block
-			&& snapshot.cursor.pos.col.0 as u16 == column
-			&& snapshot.cursor.pos.row.0 as u16 == row
+			&& (snapshot.cursor.pos.col.0 as u16) == column
+			&& (snapshot.cursor.pos.row.0 as u16) == row
 	}
 
 	fn draw_cursor(&mut self, snapshot: &Snapshot) {
@@ -629,29 +627,41 @@ impl Renderer {
 			return;
 		}
 
-		let x = origin_x + (column * metrics.cell_width) as f64;
-		let y = origin_y + (row * metrics.cell_height) as f64;
+		let start_x = origin_x + (column * metrics.cell_width) as f64;
+		let start_y = origin_y + (row * metrics.cell_height) as f64;
 		let width = metrics.cell_width as f64;
 		let height = metrics.cell_height as f64;
-		let thickness = (metrics.underline_thickness as f64 * 1.5).round().max(2.0);
 
-		let rect = match snapshot.cursor.content {
-			CursorShape::Block => Rect::new(x, y, x + width, y + height),
-			CursorShape::Underline => Rect::new(x, y + height - thickness, x + width, y + height),
-			CursorShape::Beam => Rect::new(x, y, x + thickness, y + height),
+		let calculated_thickness = metrics.underline_thickness as f64 * CURSOR_THICKNESS_MULTIPLIER;
+		let final_thickness = calculated_thickness.round().max(MINIMUM_CURSOR_THICKNESS);
+
+		let cursor_rectangle = match snapshot.cursor.content {
+			CursorShape::Block => Rect::new(start_x, start_y, start_x + width, start_y + height),
+			CursorShape::Underline => Rect::new(
+				start_x,
+				start_y + height - final_thickness,
+				start_x + width,
+				start_y + height,
+			),
+			CursorShape::Beam => Rect::new(
+				start_x,
+				start_y,
+				start_x + final_thickness,
+				start_y + height,
+			),
 			CursorShape::Hidden => return,
 		};
 
-		self.context.set_paint(Self::paint(
-			self.palette
-				.named(rio_vt::config::colors::NamedColor::Cursor),
-		));
-		self.context.fill_rect(&rect);
+		let cursor_color = self
+			.palette
+			.named(rio_vt::config::colors::NamedColor::Cursor);
+		self.context.set_paint(Self::paint(cursor_color));
+		self.context.fill_rect(&cursor_rectangle);
 	}
 }
 
 impl Rasterizer for Renderer {
-	fn size(&self) -> (u16, u16) {
+	fn dimensions(&self) -> (u16, u16) {
 		(self.width, self.height)
 	}
 
@@ -660,10 +670,6 @@ impl Rasterizer for Renderer {
 
 		self.draw_surface();
 		self.draw_backgrounds(snapshot);
-
-		// The block cursor is a background, painted before the text so the
-		// glyph lands on top of it — which is why `cell_foreground` recolours
-		// that glyph rather than inverting the cell.
 		self.draw_cursor(snapshot);
 
 		for row in 0..snapshot.screen_rows {
@@ -674,7 +680,6 @@ impl Rasterizer for Renderer {
 		self.context.render(target.as_mut(), &mut self.resources);
 	}
 }
-
 #[cfg(test)]
 mod tests {
 	use super::*;

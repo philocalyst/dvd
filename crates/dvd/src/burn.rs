@@ -32,7 +32,7 @@ use dvd_render::geom::Color;
 use dvd_render::model::{Palette, Snapshot};
 use dvd_render::render::{Renderer, Surface};
 use dvd_render::session::{Capture, Session};
-use dvd_render::stream::{Dedup, Encoder, Frame, Meta, QUEUE_DEPTH, Sink};
+use dvd_render::stream::{Deduplicator, Encoder, Frame, MAXIMUM_QUEUE_DEPTH, Metadata, Sink};
 use dvd_render::{Level, rio_vt};
 
 use crate::cli::{BurnArgs, Output};
@@ -136,14 +136,40 @@ impl Settings {
 
 /// A bare shell name has to become a path, because the PTY spawns the program
 /// directly rather than going through a shell that would search `PATH`.
-fn absolute_shell(name: &str) -> String {
+///
+/// `pub(crate)`: `record.rs` needs this too, for the same reason — a bare
+/// `--shell zsh` has to resolve against *this* process's `PATH` up front,
+/// not the PATH `login(1)`'s login-shell dance leaves the child with (see
+/// the comment on `record::run`).
+pub(crate) fn absolute_shell(name: &str) -> String {
 	if name.contains('/') {
 		return name.to_string();
 	}
 	which(name).unwrap_or_else(|| format!("/bin/{name}"))
 }
 
-fn which(program: &str) -> Option<String> {
+/// The environment variable that makes a supported shell mark its own
+/// prompt with OSC 133 (`ESC ] 133 ; A`), so readiness can be read off the
+/// terminal's own semantic-prompt bit (see `Session::cursor_row_is_prompt`)
+/// instead of guessed at by matching rendered text.
+///
+/// Only bash is wired up: it is one `PROMPT_COMMAND` env var away, no
+/// dotfile injection required, because bash runs `$PROMPT_COMMAND` itself
+/// right before drawing every prompt. zsh (`precmd_functions`) and fish
+/// (`fish_prompt`) need their own mechanism and, until that lands, fall back
+/// to the regex heuristic in `await_screen` — which still runs for every
+/// shell, semantic mark or not.
+fn shell_integration_env(shell_path: &str) -> Option<(String, String)> {
+	let name = Path::new(shell_path).file_name()?.to_str()?;
+	(name == "bash").then(|| {
+		(
+			"PROMPT_COMMAND".to_string(),
+			r"printf '\033]133;A\007'".to_string(),
+		)
+	})
+}
+
+pub(crate) fn which(program: &str) -> Option<String> {
 	std::env::var_os("PATH")?
 		.to_str()?
 		.split(':')
@@ -303,10 +329,19 @@ pub fn burn(args: &BurnArgs) -> Result<()> {
 fn record(plan: Plan) -> Result<()> {
 	let Plan {
 		settings,
-		environment,
+		mut environment,
 		outputs,
 		steps,
 	} = plan;
+
+	// Give the shell a chance to mark its own prompt (see
+	// `shell_integration_env`), unless the tape already claims this
+	// variable — an author's own `Env PROMPT_COMMAND` wins.
+	if !environment.iter().any(|(name, _)| name == "PROMPT_COMMAND")
+		&& let Some(entry) = shell_integration_env(&settings.shell)
+	{
+		environment.push(entry);
+	}
 
 	// One CPU probe for the process, shared with `vello_cpu`'s rasterizer and
 	// with our own kernels.
@@ -383,9 +418,12 @@ fn record(plan: Plan) -> Result<()> {
 
 	// Cursor blink is a property of the emulated terminal, not of the renderer:
 	// with it off the caret is a steady block and dedup collapses an idle
-	// prompt to a single frame instead of one every half second.
+	// prompt to a single frame instead of one every half second. `feed`
+	// (not `write`) applies this directly to the terminal model — the shell
+	// never sees these bytes on its input, so its line editor cannot splice
+	// them into the first typed command.
 	if !settings.cursor_blink {
-		session.write(&b"\x1b[?12l"[..])?;
+		session.feed(&b"\x1b[?12l"[..]);
 	}
 
 	// Playback speed is a property of the *file*, not of the capture. Capturing
@@ -395,13 +433,13 @@ fn record(plan: Plan) -> Result<()> {
 		.round()
 		.clamp(1.0, u8::MAX as f32) as u8;
 
-	let meta = Meta {
+	let meta = Metadata {
 		width,
 		height,
 		frames_per_second: played,
 	};
 
-	let (sender, receiver) = std::sync::mpsc::sync_channel::<Frame>(QUEUE_DEPTH);
+	let (sender, receiver) = std::sync::mpsc::sync_channel::<Frame>(MAXIMUM_QUEUE_DEPTH);
 	let encoder = Encoder::new(Box::new(renderer), sinks);
 	let encoding = std::thread::Builder::new()
 		.name("dvd-encode".to_string())
@@ -414,6 +452,8 @@ fn record(plan: Plan) -> Result<()> {
 		finished: AtomicBool::new(false),
 		stills: Mutex::new(Vec::new()),
 		screen: Mutex::new(Screen::default()),
+		activity: Mutex::new(None),
+		semantic_confirmed: AtomicBool::new(false),
 	});
 
 	let director = {
@@ -460,6 +500,12 @@ struct Stage {
 	stills: Mutex<Vec<PathBuf>>,
 	/// The most recent picture, as text, for `Wait` to match against.
 	screen: Mutex<Screen>,
+	/// When the terminal last changed, and whether it has changed at all yet.
+	/// See `await_quiet`.
+	activity: Mutex<Option<Instant>>,
+	/// Whether `Session::cursor_row_is_prompt` has ever answered yes for this
+	/// recording. See the comment on `await_screen`'s `trust_semantic_only`.
+	semantic_confirmed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -483,6 +529,16 @@ impl Screen {
 				.collect(),
 			cursor_row: snapshot.cursor.pos.row.0.max(0) as usize,
 		}
+	}
+
+	/// Whether anything has actually been drawn yet — not just "nothing
+	/// changed recently". A terminal that has never printed a single
+	/// character is not "settled", it just hasn't started; `await_quiet`
+	/// must not confuse the two, or it declares victory during a shell's own
+	/// silent startup gap and the tape types into a shell that was never
+	/// listening.
+	fn has_content(&self) -> bool {
+		self.lines.iter().any(|line| !line.trim().is_empty())
 	}
 
 	fn matches(&self, pattern: &Regex, mode: &WaitMode) -> bool {
@@ -512,7 +568,7 @@ fn pump(
 	sender: std::sync::mpsc::SyncSender<Frame>,
 ) -> Result<()> {
 	let interval = Duration::from_secs_f64(1.0 / settings.framerate as f64);
-	let mut dedup = Dedup::new(level, columns, rows);
+	let mut dedup = Deduplicator::new(level);
 	let mut scratch = Snapshot::new(columns, rows);
 
 	// The frame currently on screen, waiting to learn how long it lasts.
@@ -539,6 +595,7 @@ fn pump(
 
 		if captured == Capture::Changed {
 			*stage.screen.lock().unwrap_or_else(|e| e.into_inner()) = Screen::read(&scratch);
+			*stage.activity.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
 		}
 
 		let stills = std::mem::take(&mut *stage.stills.lock().unwrap_or_else(|e| e.into_inner()));
@@ -569,7 +626,7 @@ fn pump(
 			frame.stills = stills;
 			pending = Some(frame);
 		} else if let Some(frame) = pending.as_mut() {
-			frame.hold += 1;
+			frame.hold_ticks += 1;
 		}
 
 		if stage.finished.load(Ordering::Acquire) {
@@ -596,7 +653,8 @@ fn direct(
 	session: &Mutex<Session>,
 	stage: &Stage,
 ) -> Result<()> {
-	let result = run_steps(steps, settings, session, stage);
+	let result = await_initial_prompt(settings, session, stage)
+		.and_then(|()| run_steps(steps, settings, session, stage));
 	// However it went, the pump has to be told to stop, or the recording never
 	// ends and the error never surfaces.
 	stage.finished.store(true, Ordering::Release);
@@ -661,13 +719,26 @@ fn run_steps(
 			}
 
 			Commands::Wait(wait) => {
+				// A bare `Wait` means "the prompt is back" — the semantic
+				// mark answers that directly. `Wait /text/` means something
+				// specific must be on screen, which a fresh prompt does not
+				// establish on its own.
+				let semantic_ok = wait.pattern.is_none();
 				let pattern = match &wait.pattern {
 					Some(pattern) => pattern.clone(),
 					None => Regex::new(&settings.wait_pattern)
 						.context("the default Wait pattern is not a valid regex")?,
 				};
 				let timeout = wait.timeout.unwrap_or(settings.wait_timeout);
-				await_screen(stage, &pattern, &wait.mode, timeout)?;
+				await_screen(
+					stage,
+					session,
+					&pattern,
+					&wait.mode,
+					timeout,
+					semantic_ok,
+					None,
+				)?;
 			}
 
 			Commands::Screenshot(shot) => {
@@ -709,24 +780,171 @@ fn type_text(text: &str, rate: Duration, write: &impl Fn(Vec<u8>) -> Result<()>)
 	Ok(())
 }
 
-fn await_screen(stage: &Stage, pattern: &Regex, mode: &WaitMode, timeout: Duration) -> Result<()> {
-	let deadline = Instant::now() + timeout;
+/// How long the terminal must sit still, showing actual content, before the
+/// shell's startup is considered finished. See `is_settled`.
+///
+/// Generous on purpose. A shell's own startup is rarely one uninterrupted
+/// burst — nu in particular loads config and plugins in visible phases, with
+/// gaps between them that a short debounce reads as "done" while the shell
+/// is still mid-boot and not yet listening on stdin. Losing this race is not
+/// a slow recording, it is a silently blank one: the tape's `Type` fires
+/// into a shell that was never reading, nothing echoes, and nothing after
+/// it ever will either. Paying an extra few hundred milliseconds once, at
+/// the very start, is cheap next to that.
+const STARTUP_QUIET: Duration = Duration::from_millis(600);
 
-	while Instant::now() < deadline {
-		if stage
+/// Block until the shell's own prompt shows up, so `Type` cannot race the
+/// child's startup.
+///
+/// The director and the shell both start the instant the PTY opens; nothing
+/// signals "the shell has claimed the terminal and is reading stdin" other
+/// than the terminal itself. A fixed delay would only be a guess — right for
+/// one machine's boot time and wrong for the next. Three signals race, and
+/// whichever answers first wins:
+///
+/// 1. `Session::cursor_row_is_prompt` — OSC 133 shell integration (see
+///    `shell_integration_env`). Unambiguous where the shell supports it, but
+///    today that is bash only.
+/// 2. `settings.wait_pattern` matched against whatever prompt text the shell
+///    actually shows. Works for any shell whose prompt happens to end the
+///    way the pattern expects; nothing dvd controls.
+/// 3. `await_quiet` — the terminal has changed at least once and then gone
+///    still for `STARTUP_QUIET`. Knows nothing about prompts, escape codes,
+///    or shell dialects, so it is the one signal every shell gets for free —
+///    bash, zsh, fish, nu, elvish, whatever the tape names. It is also the
+///    slowest of the three, since it has to wait out the debounce, which is
+///    exactly why it is not the *only* signal: 1 and 2 usually win first.
+///
+/// dvd does not inject a synthetic *prompt* of its own — only, where
+/// possible, a marker around the shell's real one.
+fn await_initial_prompt(
+	settings: &Settings,
+	session: &Mutex<Session>,
+	stage: &Stage,
+) -> Result<()> {
+	let pattern = Regex::new(&settings.wait_pattern)
+		.context("the default Wait pattern is not a valid regex")?;
+	await_screen(
+		stage,
+		session,
+		&pattern,
+		&WaitMode::Line,
+		settings.wait_timeout,
+		true,
+		Some(STARTUP_QUIET),
+	)
+	.context("waiting for the shell to start")
+}
+
+/// Whether the terminal is actually showing something, and has sat still
+/// with that something on screen for `debounce`.
+///
+/// Shell-agnostic on purpose: it does not parse prompts, does not need
+/// escape-sequence cooperation from the shell, and cannot be fooled by a
+/// theme or locale dvd has never seen. But "nothing changed recently" alone
+/// is not "ready" — a shell can go quiet *during* startup, between an early
+/// terminal-setup escape and the prompt it hasn't drawn yet, and a blank
+/// screen sitting still is exactly what a not-yet-ready shell looks like.
+/// Requiring `Screen::has_content` too is what tells the two apart: this
+/// only fires once there is real, settled content, not just settled
+/// silence. The trade-off is latency — a shell whose startup burst finishes
+/// instantly still costs `debounce` here — which is why this is one of
+/// three signals in `await_initial_prompt` rather than the only one.
+fn is_settled(stage: &Stage, debounce: Duration) -> bool {
+	let quiet = stage
+		.activity
+		.lock()
+		.unwrap_or_else(|error| error.into_inner())
+		.is_some_and(|last| last.elapsed() >= debounce);
+
+	quiet
+		&& stage
 			.screen
 			.lock()
 			.unwrap_or_else(|error| error.into_inner())
-			.matches(pattern, mode)
+			.has_content()
+}
+
+/// Poll until the shell's semantic-prompt mark, `pattern`, or (if `settle`
+/// is given) a quiet terminal matches — whichever comes first.
+///
+/// `semantic_ok` gates the OSC 133 check: it only makes sense when the
+/// caller is asking "has the shell's own prompt come back", which is true
+/// for the implicit initial wait and for a bare `Wait` (no explicit
+/// pattern) — never for a tape's own `Wait /some output/`, where a fresh
+/// prompt appearing proves nothing about whether that text showed up. The
+/// same reasoning is why `settle` is only ever `Some` from
+/// `await_initial_prompt`: mid-tape, a running command can have perfectly
+/// legitimate quiet gaps before it finishes, and treating one as "done"
+/// would cut a `Wait` short.
+///
+/// `trust_semantic_only` (once `Stage::semantic_confirmed` is set, which
+/// happens the first time the semantic mark is ever observed for this
+/// recording) stops the regex and quiet-period fallbacks from voting at
+/// all. They exist for shells the semantic mark cannot speak for; once it
+/// has spoken for this one, they are not a second opinion, they are a false
+/// alarm waiting to happen — a full-screen program like `fzf` draws its own
+/// `>` search box and redraws it continuously while it runs, which the
+/// regex cannot tell apart from the real prompt coming back, and which
+/// never goes quiet the way `is_settled` wants either. The semantic mark
+/// does not have this problem: it only fires when the shell's own
+/// `PROMPT_COMMAND` runs, which does not happen until `fzf` actually exits
+/// and the shell's REPL loop gets control back.
+fn await_screen(
+	stage: &Stage,
+	session: &Mutex<Session>,
+	pattern: &Regex,
+	mode: &WaitMode,
+	timeout: Duration,
+	semantic_ok: bool,
+	settle: Option<Duration>,
+) -> Result<()> {
+	let deadline = Instant::now() + timeout;
+
+	while Instant::now() < deadline {
+		let semantic_hit = semantic_ok
+			&& session
+				.lock()
+				.unwrap_or_else(|error| error.into_inner())
+				.cursor_row_is_prompt();
+
+		if semantic_hit {
+			stage.semantic_confirmed.store(true, Ordering::Release);
+			return Ok(());
+		}
+
+		let trust_semantic_only = semantic_ok && stage.semantic_confirmed.load(Ordering::Acquire);
+
+		let settled =
+			!trust_semantic_only && settle.is_some_and(|debounce| is_settled(stage, debounce));
+
+		if settled
+			|| (!trust_semantic_only
+				&& stage
+					.screen
+					.lock()
+					.unwrap_or_else(|error| error.into_inner())
+					.matches(pattern, mode))
 		{
 			return Ok(());
 		}
 		std::thread::sleep(Duration::from_millis(10));
 	}
 
+	let seen_anything = stage
+		.activity
+		.lock()
+		.unwrap_or_else(|error| error.into_inner())
+		.is_some();
+
 	bail!(
-		"waited {timeout:?} for /{}/ and it never matched",
-		pattern.as_str()
+		"waited {timeout:?} for /{}/ and it never matched ({})",
+		pattern.as_str(),
+		if seen_anything {
+			"the terminal did change, just not into a match"
+		} else {
+			"the terminal never produced any output at all — the shell may not have started"
+		}
 	)
 }
 

@@ -16,11 +16,11 @@ Set Theme "Dracula"
 Set Framerate 30
 Set TypingSpeed 40ms
 # `true`, matching the dvd twin — not because VHS has the same problem, but
-# so the two tapes stay textually identical settings. `dvd` is forced onto
-# `true` by a real bug (see the comment in macchina.dvd and the W7 report):
-# `Set CursorBlink false` there corrupts the very first typed command. VHS
-# has no such issue — it never writes terminal-mode escapes through the PTY
-# input path — so `false` would have been fine on this side alone.
+# so the two tapes stay textually identical settings (see the comment in
+# macchina.dvd: `dvd`'s twin no longer *needs* `true`, a past bug there has
+# since been fixed, but it stays `true` here too for the same reason it stays
+# `true` there — textual parity between the two tapes). VHS never wrote
+# terminal-mode escapes through the PTY input path, so it never had this bug.
 Set CursorBlink true
 
 Require macchina

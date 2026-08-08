@@ -79,7 +79,7 @@ impl OutlinePen for PathPen {
 /// `BezPath` without cloning — see the module doc for how the borrow is
 /// structured to make that work.
 pub struct Outlines {
-	cache: FxHashMap<GlyphKey, BezPath>,
+	pub cache: FxHashMap<GlyphKey, BezPath>,
 }
 
 impl Default for Outlines {

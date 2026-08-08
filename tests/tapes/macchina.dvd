@@ -18,23 +18,22 @@ Set Padding 24
 Set Theme "dracula"
 Set Framerate 30
 Set TypingSpeed 40ms
-# Not `false`. `Set CursorBlink false` (also the burn-time default) makes
-# crates/dvd/src/burn.rs:374 write the raw byte sequence `\x1b[?12l` through
-# `session.write`, which delivers it to the PTY as if a user had typed it,
-# rather than feeding it to the VT parser that models the emulated terminal's
-# own state. The shell's line editor cannot interpret a DECRST-12 control
-# sequence arriving as keyboard input; it re-echoes fragments of it and
-# spliced them into the very next keystrokes, and on this machine that turns
-# the first `Type "macchina"` below into a bogus, failing command (confirmed
-# by burning this tape with the setting flipped both ways — see the W7
-# report). `true` skips that write entirely, at the cost of a cursor that can
-# be mid-blink in whichever frame `ffmpeg` happens to land on.
+# `true` here purely to stay textually identical to the VHS twin (see that
+# file's own comment on this line) — not to dodge a bug. `Set CursorBlink
+# false` used to make `burn.rs` write the raw byte sequence `\x1b[?12l`
+# through `session.write`, delivering it to the PTY as if a user had typed
+# it; the shell's line editor could not interpret a DECRST-12 control
+# sequence arriving as keyboard input and spliced fragments of it into the
+# next keystrokes (the W7 report). `session::Session::feed` now applies that
+# escape straight to the VT parser instead — the same path real terminal
+# *output* takes — so the shell never sees it and `false` is safe again.
 Set CursorBlink true
 
-# A beat before the first keystroke, so `Type` does not race the shell's own
-# startup banner — without it, characters typed before the shell has claimed
-# the terminal can interleave with its boot output instead of landing after
-# the prompt.
+# No longer load-bearing: `direct()` now blocks on the shell's own prompt
+# actually appearing (the same pattern `Wait` matches) before the first
+# `Type`, so nothing can race the boot banner. Left in as extra margin for
+# `macchina`'s own startup rather than the shell's, and because removing it
+# buys nothing.
 Sleep 500ms
 
 Type "macchina"

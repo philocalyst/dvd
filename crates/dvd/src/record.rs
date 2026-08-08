@@ -25,8 +25,9 @@ use dvd_render::fonts::Fonts;
 use dvd_render::model::{Palette, Snapshot};
 use dvd_render::render::{Renderer, Surface};
 use dvd_render::session::{Capture, Session};
-use dvd_render::stream::{Dedup, Encoder, Frame, Meta, QUEUE_DEPTH, Sink};
+use dvd_render::stream::{Deduplicator, Encoder, Frame, MAXIMUM_QUEUE_DEPTH, Metadata, Sink};
 use dvd_render::{Level, rio_vt};
+use termwiz::terminal::Terminal as _;
 
 use crate::cli::Output;
 use crate::theme;
@@ -66,10 +67,17 @@ pub fn record(shell: &str, output: PathBuf) -> Result<()> {
 	// Inherit the terminal's size. termwiz reads the current winsize from
 	// `/dev/tty`, so the recording starts at the same dimensions the user's
 	// terminal has right now — not a hard-coded 1200x600.
-	let (columns, rows) = inherit_terminal_size()?;
+	let (columns, rows) = inherit_terminal_size();
 
+	// `--shell` defaults to a bare name (see `cli::default_shell`), and the
+	// PTY spawns the program directly rather than through a shell that would
+	// search `PATH` — so it has to become a path now, against *this*
+	// process's own `PATH`. Resolving it later, inside the child, would mean
+	// asking the PATH that macOS's `login(1)` login-shell dance leaves
+	// behind, which is reordered relative to this process's own — the wrong
+	// shell can win if two versions share a name across directories.
 	let config = RecordConfig {
-		shell: shell.to_string(),
+		shell: crate::burn::absolute_shell(shell),
 		outputs: vec![(output, format)],
 		columns,
 		rows,
@@ -87,20 +95,24 @@ pub fn record(shell: &str, output: PathBuf) -> Result<()> {
 
 /// Read the current terminal's grid size (columns × rows) via termwiz.
 ///
-/// Falls back to 80×24 if `/dev/tty` is not available (e.g. piping output),
-/// because the recording still needs *a* size to open the PTY at.
-fn inherit_terminal_size() -> Result<(u16, u16)> {
-	// Try COLUMNS and LINES environment variables first, then default to 80x24.
-	let cols = std::env::var("COLUMNS")
-		.ok()
-		.and_then(|s| s.parse::<u16>().ok())
-		.unwrap_or(80);
-	let rows = std::env::var("LINES")
-		.ok()
-		.and_then(|s| s.parse::<u16>().ok())
-		.unwrap_or(24);
+/// `COLUMNS`/`LINES` are shell variables, not environment ones — bash and
+/// zsh both keep them local unless a script `export`s them, so reading them
+/// from `std::env` almost never finds anything and this used to silently
+/// fall back to a hard-coded 80×24 on every real invocation. `new_terminal`
+/// opens `/dev/tty` directly and asks the kernel via `TIOCGWINSZ`, which is
+/// what actually reflects the size of the terminal the user is looking at
+/// right now. Falls back to 80×24 only when there is no controlling
+/// terminal to ask (piped output, no tty at all) — the recording still
+/// needs *a* size to open the PTY at.
+fn inherit_terminal_size() -> (u16, u16) {
+	let size = termwiz::caps::Capabilities::new_from_env()
+		.and_then(termwiz::terminal::new_terminal)
+		.and_then(|mut terminal| terminal.get_screen_size());
 
-	Ok((cols, rows))
+	match size {
+		Ok(size) => (size.cols as u16, size.rows as u16),
+		Err(_) => (80, 24),
+	}
 }
 
 /// The live recording pipeline. This is the same shape as `burn.rs::record`:
@@ -134,14 +146,7 @@ fn run(config: RecordConfig) -> Result<()> {
 		.saturating_sub((chrome / metrics.cell_height) as u16)
 		.max(1);
 
-	let renderer = Renderer::new(
-		fonts,
-		palette.clone(),
-		surface,
-		columns,
-		rows,
-		level,
-	)?;
+	let renderer = Renderer::new(fonts, palette.clone(), surface, columns, rows, level)?;
 	let (width, height) = renderer.size();
 
 	// Build the sinks — same helper as burn, just local because burn owns
@@ -188,13 +193,13 @@ fn run(config: RecordConfig) -> Result<()> {
 	}
 
 	let played = config.framerate.clamp(1, u8::MAX as u32) as u8;
-	let meta = Meta {
+	let meta = Metadata {
 		width,
 		height,
 		frames_per_second: played,
 	};
 
-	let (sender, receiver) = std::sync::mpsc::sync_channel::<Frame>(QUEUE_DEPTH);
+	let (sender, receiver) = std::sync::mpsc::sync_channel::<Frame>(MAXIMUM_QUEUE_DEPTH);
 	let encoder = Encoder::new(Box::new(renderer), sinks);
 	let encoding = std::thread::Builder::new()
 		.name("dvd-encode".to_string())
@@ -221,15 +226,7 @@ fn run(config: RecordConfig) -> Result<()> {
 			.context("starting the director thread")?
 	};
 
-	let pump_result = pump(
-		&session,
-		&stage,
-		&config,
-		columns,
-		rows,
-		level,
-		sender,
-	);
+	let pump_result = pump(&session, &stage, &config, columns, rows, level, sender);
 
 	let directed = director
 		.join()
@@ -310,7 +307,7 @@ fn pump(
 	sender: std::sync::mpsc::SyncSender<Frame>,
 ) -> Result<()> {
 	let interval = Duration::from_secs_f64(1.0 / config.framerate as f64);
-	let mut dedup = Dedup::new(level, columns, rows);
+	let mut dedup = Deduplicator::new(level);
 	let mut scratch = Snapshot::new(columns, rows);
 
 	let mut pending: Option<Frame> = None;
@@ -355,7 +352,7 @@ fn pump(
 
 			pending = Some(Frame::new(Arc::new(snapshot), 1));
 		} else if let Some(frame) = pending.as_mut() {
-			frame.hold += 1;
+			frame.hold_ticks += 1;
 		}
 
 		if stage.finished.load(Ordering::Acquire) {

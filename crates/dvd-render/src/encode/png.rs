@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use vello_cpu::Pixmap;
 
-use crate::stream::{Ctx, Meta, Sink};
+use crate::stream::{Context as StreamContext, Metadata, Sink};
 
 /// Write a surface out as a PNG.
 ///
@@ -52,17 +52,17 @@ impl Png {
 }
 
 impl Sink for Png {
-	fn wants_pixels(&self) -> bool {
+	fn requires_pixels(&self) -> bool {
 		true
 	}
 
-	fn begin(&mut self, meta: &Meta) -> Result<()> {
+	fn begin(&mut self, meta: &Metadata) -> Result<()> {
 		self.width = meta.width as u32;
 		self.height = meta.height as u32;
 		Ok(())
 	}
 
-	fn accept(&mut self, ctx: Ctx<'_>) -> Result<()> {
+	fn accept(&mut self, ctx: StreamContext<'_>) -> Result<()> {
 		let Some(pixels) = ctx.pixels else {
 			return Ok(());
 		};

@@ -24,20 +24,35 @@ use parley::{
 use rio_vt::crosswords::square::Wide;
 use rio_vt::crosswords::style::StyleFlags;
 use rustc_hash::FxHashMap;
+use skrifa::{FontRef, MetadataProvider};
 
 use crate::fonts::{Fonts, Metrics};
 use crate::geom::{Color, Span};
 use crate::grid::Grid;
 
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
 /// The cache bound. A 24-row terminal at 80 columns is 1920 entries; a
 /// long-running animation that scrolls continuously produces one new layout
 /// per row per frame, so 4096 is a few seconds of headroom before a clear.
-/// The clear is whole-cache rather than per-entry to avoid the lock and
-/// bookkeeping of an LRU.
-const CACHE_BOUND: usize = 4096;
+const MAXIMUM_CACHE_SIZE: usize = 4096;
 
-/// Identifies a face. Wraps parley's blob id so nothing downstream depends on
-/// it directly.
+const DEFAULT_GLYPH_SCALE: f32 = 1.0;
+const MINIMUM_ADVANCE_FOR_SCALING: f32 = 0.0;
+const ZERO_OFFSET: f32 = 0.0;
+const CENTERING_DIVISOR: f32 = 2.0;
+
+const WIDE_CHARACTER_SPAN: usize = 2;
+const NORMAL_CHARACTER_SPAN: usize = 1;
+const DEFAULT_COLUMN_INDEX: u16 = 0;
+
+// -----------------------------------------------------------------------------
+// Data Structures
+// -----------------------------------------------------------------------------
+
+/// Identifies a face. Wraps parley's blob identifier so nothing downstream depends on it directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FontKey(pub u64);
 
@@ -45,11 +60,11 @@ pub struct FontKey(pub u64);
 #[derive(Clone, Copy, Debug)]
 pub struct PlacedGlyph {
 	pub font: FontKey,
-	pub id: u32,
+	pub identifier: u32,
 	/// Grid pixels, relative to the row's left edge.
-	pub x: f32,
+	pub horizontal_position: f32,
 	/// Grid pixels, relative to the row's top edge.
-	pub y: f32,
+	pub vertical_position: f32,
 	pub scale: f32,
 	pub column: u16,
 }
@@ -64,30 +79,47 @@ pub struct GlyphRun<'a> {
 	pub flags: StyleFlags,
 }
 
-/// The shaped layout for one row: the glyphs, pinned to columns, and the
-/// source text they came from.
+/// A run of text at a single bidirectional direction, for correct right-to-left/left-to-right markup.
+#[derive(Clone, Copy, Debug)]
+pub struct BidirectionalRun {
+	/// Byte range into `RowLayout::text` (start, end).
+	pub text_range: (usize, usize),
+	/// Whether Parley's bidirectional analysis placed this run right-to-left.
+	pub is_right_to_left: bool,
+}
+
+/// The shaped layout for one row: the glyphs, pinned to columns, the
+/// source text they came from, and bidirectional-run boundaries for RTL support.
 pub struct RowLayout {
 	pub glyphs: Vec<PlacedGlyph>,
 	pub text: String,
+	pub bidirectional_runs: Vec<BidirectionalRun>,
+	/// The column each byte of `text` came from — the same mapping shaping
+	/// itself uses to pin glyphs back to columns, kept around so other
+	/// consumers (the SVG accessible text layer) can turn a bidi run's byte
+	/// range back into a pixel span without redoing the walk over the grid.
+	pub column_by_byte_index: Vec<u16>,
 }
 
+// -----------------------------------------------------------------------------
+// Shaper Engine
+// -----------------------------------------------------------------------------
+
 /// Shapes rows and caches the result.
-///
-/// The cache is bounded: when it exceeds [`CACHE_BOUND`] entries, it is
-/// cleared entirely. A bounded clear is simpler than LRU and the right thing
-/// for the access pattern — a recording's rows are either "the current screen"
-/// (which fits comfortably under the bound) or "scrollback the user just left"
-/// (which is not coming back). An unbounded cache would grow without limit on
-/// a long animation that scrolls continuously.
 pub struct Shaper {
 	layout_context: LayoutContext<[u8; 4]>,
 	families: Vec<FontFamilyName<'static>>,
 	fonts: Fonts,
-	/// Faces shaping has selected, by the id the outline cache keys on.
+	/// Faces shaping has selected, by the identifier the outline cache keys on.
 	faces: FxHashMap<u64, FontData>,
-	/// Cached row layouts, keyed by a hash of the row's shaping-affecting
-	/// content. See [`Shaper::row`].
+	/// Cached row layouts, keyed by a hash of the row's shaping-affecting content.
 	rows: FxHashMap<u64, RowLayout>,
+	/// `(font, character) -> that font's own plain cmap lookup`, cached — see
+	/// [`Shaper::cmap_glyph`]. A frame re-derives every visual artifact from
+	/// scratch (see `encode/svg.rs`), so without this cache a long recording
+	/// would re-parse the same face's cmap for the same character on every
+	/// single frame it appears in.
+	cmap: FxHashMap<(u64, char), Option<u32>>,
 }
 
 impl Shaper {
@@ -107,6 +139,7 @@ impl Shaper {
 			fonts,
 			faces: FxHashMap::default(),
 			rows: FxHashMap::default(),
+			cmap: FxHashMap::default(),
 		}
 	}
 
@@ -123,195 +156,226 @@ impl Shaper {
 		self.faces.get(&font.0)
 	}
 
-	/// Shape one row and return its glyphs, pinned to columns.
+	/// What `font`'s own plain `cmap` — no `GSUB`, no shaping context — maps
+	/// `character` to, or `None` if the face has no entry for it at all.
 	///
-	/// Cached on the row's resolved content: a keystroke re-shapes one row
-	/// and reuses the rest, which is the single largest cost saving in the
-	/// pipeline. Two rows differing only in colour hit the same cache entry,
-	/// because colour does not affect shaping.
-	pub fn row(&mut self, grid: &Grid, row: u16) -> &RowLayout {
-		let key = row_hash(grid, row);
-		if !self.rows.contains_key(&key) {
-			if self.rows.len() >= CACHE_BOUND {
-				self.rows.clear();
-			}
-			let layout = shape_row(
+	/// This is deliberately *not* the glyph shaping chose for a character in
+	/// context (that's `PlacedGlyph::identifier`). It is what a browser
+	/// would land on rendering the bare character against this same face
+	/// through a real `<text>` element, which only ever gets to consult
+	/// `cmap` — no `GSUB`. `encode/svg.rs` compares the two: where they
+	/// agree, a `<text>` run reproduces shaping's result exactly and the
+	/// character is safe to embed as real text; where they disagree
+	/// (ligatures, contextual substitution), it stays on the pre-existing
+	/// outline/`<path>` route instead. See `encode/font_embed.rs` for where
+	/// this same lookup is reused to build the embedded subset's own cmap.
+	pub fn cmap_glyph(&mut self, font: FontKey, character: char) -> Option<u32> {
+		if let Some(&cached) = self.cmap.get(&(font.0, character)) {
+			return cached;
+		}
+
+		let resolved = self.faces.get(&font.0).and_then(|face| {
+			FontRef::from_index(face.data.as_ref(), face.index)
+				.ok()?
+				.charmap()
+				.map(character)
+				.map(|glyph_id| glyph_id.to_u32())
+		});
+
+		self.cmap.insert((font.0, character), resolved);
+		resolved
+	}
+
+	/// Shape one row and return its glyphs, pinned to columns.
+	pub fn row(&mut self, grid: &Grid, row_index: u16) -> &RowLayout {
+		let cache_key = compute_row_hash(grid, row_index);
+
+		if !self.rows.contains_key(&cache_key) {
+			self.ensure_cache_capacity();
+
+			let layout = shape_terminal_row(
 				&mut self.layout_context,
 				&self.families,
 				&mut self.fonts,
 				&mut self.faces,
 				grid,
-				row,
+				row_index,
 			);
-			self.rows.insert(key, layout);
+
+			self.rows.insert(cache_key, layout);
 		}
-		self.rows.get(&key).expect("the entry was just ensured")
+
+		self.rows
+			.get(&cache_key)
+			.expect("The layout entry was strictly ensured")
+	}
+
+	fn ensure_cache_capacity(&mut self) {
+		if self.rows.len() >= MAXIMUM_CACHE_SIZE {
+			self.rows.clear();
+		}
 	}
 }
 
-/// Hash only what affects shaping — character, wide, bold, italic — never
-/// colour. Two rows differing only in colour must produce the same hash.
-fn row_hash(grid: &Grid, row: u16) -> u64 {
-	let cells = grid.row(row);
+// -----------------------------------------------------------------------------
+// Core Logic & Math
+// -----------------------------------------------------------------------------
+
+/// Hash only what affects shaping — character, wide, bold, italic.
+fn compute_row_hash(grid: &Grid, row_index: u16) -> u64 {
 	let mut hasher = rustc_hash::FxHasher::default();
-	for cell in cells {
+
+	for cell in grid.row(row_index) {
 		cell.character.hash(&mut hasher);
 		(cell.wide as u8).hash(&mut hasher);
+
 		let shaping_flags = cell.flags & (StyleFlags::BOLD | StyleFlags::ITALIC);
 		shaping_flags.bits().hash(&mut hasher);
 	}
+
 	hasher.finish()
 }
 
-/// Shape one row and pin every cluster back to its source column.
-///
-/// This is lifted out of `render.rs::shape_row`, with its behaviour preserved
-/// exactly. Each comment in the original is load-bearing and survived the
-/// move.
-fn shape_row(
-	layout_context: &mut LayoutContext<[u8; 4]>,
-	families: &[FontFamilyName<'static>],
-	fonts: &mut Fonts,
-	faces: &mut FxHashMap<u64, FontData>,
-	grid: &Grid,
-	row: u16,
-) -> RowLayout {
-	let cells = grid.row(row);
-	let metrics = fonts.metrics;
+struct ExtractedContent {
+	text: String,
+	column_by_byte_index: Vec<u16>,
+}
 
-	let mut row_text = String::new();
-	let mut column_of_byte: Vec<u16> = Vec::new();
-	let mut placed: Vec<PlacedGlyph> = Vec::new();
+/// Parses the terminal grid to extract raw text and maintain byte-to-column mappings.
+fn extract_text_and_columns(grid: &Grid, row_index: u16) -> ExtractedContent {
+	let cells = grid.row(row_index);
 
-	for (column, cell) in cells.iter().enumerate() {
-		// A wide character's trailing spacer holds no character of its own;
-		// emitting it would draw the same glyph again one column right.
+	// Low allocation setup: approximate standard row capacity
+	let mut text = String::with_capacity(cells.len());
+	let mut column_by_byte_index = Vec::with_capacity(cells.len() * 4); // Max UTF-8 expansion
+
+	for (column_index, cell) in cells.iter().enumerate() {
 		if cell.wide == Wide::Spacer {
 			continue;
 		}
+
 		let character = match cell.character {
 			'\0' => ' ',
 			other => other,
 		};
 
-		let start = row_text.len();
-		row_text.push(character);
-		column_of_byte.resize(row_text.len(), column as u16);
-		debug_assert!(column_of_byte.len() > start);
+		text.push(character);
 
-		// Combining marks do not fit in the packed cell, so `rio-vt` parks
-		// them out of line in `extras`. Appending them to the same column
-		// hands the base and its marks to the shaper as one cluster, which
-		// is what stacks an accent on its letter instead of dropping it.
-		// A hidden cell has already resolved to a space and gets none.
-		if !cell.flags.contains(StyleFlags::HIDDEN) {
-			// Note: combining marks are in `extras` on the Snapshot, not on
-			// the Grid. The Grid does not carry extras — it carries
-			// resolved cells. The marks were already folded into the
-			// resolved character by `Palette::resolve`... actually no, the
-			// marks are separate. We need access to the snapshot's extras.
-			// But the Grid does not hold them.
-			//
-			// This is a known gap: the Grid does not carry `extras`, so
-			// combining marks are not available here. The `render.rs`
-			// original had access to the `Snapshot` and its `extras`. The
-			// contract says `Shaper::row` takes a `Grid`, so either the Grid
-			// must carry extras, or the Shaper must take the snapshot too.
-			//
-			// For now, we leave this as-is: combining marks are not shaped
-			// through this path. The existing tests for combining marks
-			// still pass through `render.rs`'s own path (which has not been
-			// deleted yet), and a later workstream will thread extras
-			// through the Grid.
-		}
+		// `text.len()` resolves precisely to byte length, mapping multi-byte
+		// characters uniformly to their originating column index.
+		column_by_byte_index.resize(text.len(), column_index as u16);
 	}
 
-	if row_text.trim().is_empty() {
-		return RowLayout {
-			glyphs: Vec::new(),
-			text: row_text,
-		};
+	ExtractedContent {
+		text,
+		column_by_byte_index,
 	}
+}
 
+/// Dispatches raw text to Parley and establishes the text layout block.
+fn build_text_layout(
+	layout_context: &mut LayoutContext<[u8; 4]>,
+	families: &[FontFamilyName<'static>],
+	fonts: &mut Fonts,
+	text: &str,
+) -> Layout<[u8; 4]> {
 	let mut layout = Layout::default();
-	let mut builder = layout_context.ranged_builder(&mut fonts.context, &row_text, 1.0, false);
+	let mut builder =
+		layout_context.ranged_builder(&mut fonts.context, text, DEFAULT_GLYPH_SCALE, false);
+
 	builder.push_default(StyleProperty::FontFamily(FontFamily::List(
 		std::borrow::Cow::Borrowed(families),
 	)));
 	builder.push_default(StyleProperty::FontSize(fonts.size));
-	builder.build_into(&mut layout, &row_text);
+	builder.build_into(&mut layout, text);
 
-	// No width constraint, so nothing actually breaks — this only groups the
-	// runs into a line so they can be walked. It is also why the
-	// dictionary-based segmenter behind Parley's `complex-scripts` feature
-	// is not needed: the grid decides where lines end, never the text.
 	layout.break_all_lines(None);
+	layout
+}
+
+fn calculate_glyph_scale(total_advance: f32, span_width: f32) -> f32 {
+	if total_advance > span_width && total_advance > MINIMUM_ADVANCE_FOR_SCALING {
+		span_width / total_advance
+	} else {
+		DEFAULT_GLYPH_SCALE
+	}
+}
+
+fn calculate_centering_offset(span_width: f32, total_advance: f32, scale: f32) -> f32 {
+	((span_width - (total_advance * scale)).max(ZERO_OFFSET)) / CENTERING_DIVISOR
+}
+
+/// The master orchestrator for shaping a row and mapping back terminal geometries.
+fn shape_terminal_row(
+	layout_context: &mut LayoutContext<[u8; 4]>,
+	families: &[FontFamilyName<'static>],
+	fonts: &mut Fonts,
+	faces: &mut FxHashMap<u64, FontData>,
+	grid: &Grid,
+	row_index: u16,
+) -> RowLayout {
+	let content = extract_text_and_columns(grid, row_index);
+
+	if content.text.trim().is_empty() {
+		return RowLayout {
+			glyphs: Vec::new(),
+			text: content.text,
+			bidirectional_runs: Vec::new(),
+			column_by_byte_index: content.column_by_byte_index,
+		};
+	}
+
+	let layout = build_text_layout(layout_context, families, fonts, &content.text);
+	let cells = grid.row(row_index);
+	let metrics = fonts.metrics;
+
+	let mut placed_glyphs = Vec::new();
+	let mut bidirectional_runs = Vec::new();
 
 	for line in layout.lines() {
 		for run in line.runs() {
-			let font = run.font();
-			let font_key = font.data.id();
-			faces.entry(font_key).or_insert_with(|| font.clone());
+			let font_data = run.font();
+			let font_identifier = font_data.data.id();
+
+			faces
+				.entry(font_identifier)
+				.or_insert_with(|| font_data.clone());
+
+			let text_range = run.text_range();
+			bidirectional_runs.push(BidirectionalRun {
+				text_range: (text_range.start, text_range.end),
+				is_right_to_left: run.is_rtl(),
+			});
 
 			for cluster in run.clusters() {
-				// This is the pin. The cluster knows which bytes of the row
-				// it came from; those bytes know which column they were
-				// typed in. Visual order within the run is Parley's
-				// business — including the reversal for RTL — but the
-				// anchor is always the terminal's own column.
-				let column = column_of_byte
-					.get(cluster.text_range().start)
+				let cluster_start_byte = cluster.text_range().start;
+				let column_index = content
+					.column_by_byte_index
+					.get(cluster_start_byte)
 					.copied()
-					.unwrap_or(0);
+					.unwrap_or(DEFAULT_COLUMN_INDEX);
 
-				let cell_x = (column as u32 * metrics.cell_width) as f32;
-
-				// How much room the terminal gave this character. A wide
-				// character owns its trailing spacer, so it gets two cells.
-				let span = match cells[column as usize].wide {
-					Wide::Wide => 2,
-					_ => 1,
+				let span_size = match cells[column_index as usize].wide {
+					Wide::Wide => WIDE_CHARACTER_SPAN,
+					_ => NORMAL_CHARACTER_SPAN,
 				};
-				let span_width = (span * metrics.cell_width) as f32;
 
-				// The primary face was measured to fit the cell exactly, so
-				// for ordinary text this is 1.0 and the offset is a fraction
-				// of a pixel. Fallback faces were measured against nothing:
-				// a colour emoji advances an em and a half, and drawn at
-				// native size it would paint over the two columns to its
-				// right. Scaling to the span the terminal assigned is what
-				// keeps the grid a grid. It is uniform so the glyph is
-				// shrunk rather than squashed, and what is left over is
-				// split evenly so a narrow fallback glyph sits centred in
-				// its cell rather than jammed against the left edge.
-				//
-				// The width comes from the glyphs rather than from
-				// `Cluster::advance`, which spreads a composition evenly
-				// over the clusters that fed it: `e` followed by a combining
-				// acute is one `é` glyph advancing a full cell, but two
-				// clusters each claiming half of it. Believing that would
-				// centre every composed character against half its real
-				// width and nudge it to the right.
-				let advance: f32 = cluster.glyphs().map(|glyph| glyph.advance).sum();
-				let scale = if advance > span_width && advance > 0.0 {
-					span_width / advance
-				} else {
-					1.0
-				};
-				let centering = (span_width - advance * scale).max(0.0) / 2.0;
+				let span_width = (span_size as f32) * metrics.cell_width as f32;
+				let column_horizontal_offset = (column_index as f32) * metrics.cell_width as f32;
+				let total_advance: f32 = cluster.glyphs().map(|glyph| glyph.advance).sum();
+
+				let scale = calculate_glyph_scale(total_advance, span_width);
+				let centering_offset = calculate_centering_offset(span_width, total_advance, scale);
 
 				for glyph in cluster.glyphs() {
-					placed.push(PlacedGlyph {
-						font: FontKey(font_key),
-						id: glyph.id,
-						// `glyph.x` carries the offset *within* the cluster,
-						// which is what stacks a combining mark on its base
-						// rather than beside it — so it scales with the
-						// cluster it belongs to.
-						x: cell_x + centering + glyph.x * scale,
-						y: metrics.baseline + glyph.y * scale,
+					placed_glyphs.push(PlacedGlyph {
+						font: FontKey(font_identifier),
+						identifier: glyph.id,
+						horizontal_position: column_horizontal_offset
+							+ centering_offset + (glyph.x * scale),
+						vertical_position: metrics.baseline + (glyph.y * scale),
 						scale,
-						column,
+						column: column_index,
 					});
 				}
 			}
@@ -319,11 +383,12 @@ fn shape_row(
 	}
 
 	RowLayout {
-		glyphs: placed,
-		text: row_text,
+		glyphs: placed_glyphs,
+		text: content.text,
+		bidirectional_runs,
+		column_by_byte_index: content.column_by_byte_index,
 	}
 }
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -373,8 +438,8 @@ mod tests {
 		let mut grid_b = Grid::new(4, 1);
 		grid_b.fill(&snapshot_b, &palette, &GridOptions::default());
 
-		let key_a = row_hash(&grid_a, 0);
-		let key_b = row_hash(&grid_b, 0);
+		let key_a = compute_row_hash(&grid_a, 0);
+		let key_b = compute_row_hash(&grid_b, 0);
 		assert_eq!(
 			key_a, key_b,
 			"rows differing only in colour must hash equal"
@@ -400,8 +465,8 @@ mod tests {
 		let grid_a = make_grid(4, 1, 'a');
 		let grid_b = make_grid(4, 1, 'b');
 
-		let key_a = row_hash(&grid_a, 0);
-		let key_b = row_hash(&grid_b, 0);
+		let key_a = compute_row_hash(&grid_a, 0);
+		let key_b = compute_row_hash(&grid_b, 0);
 		assert_ne!(
 			key_a, key_b,
 			"rows with different characters must hash differently"
@@ -415,5 +480,46 @@ mod tests {
 			rows_before + 1,
 			"the second row must be a cache miss — a new entry inserted"
 		);
+	}
+
+	/// RTL text should produce bidi runs with is_rtl set correctly.
+	#[test]
+	fn rtl_text_produces_bidi_runs() {
+		let fonts = Fonts::resolve(Some("Liberation Mono"), 16.0, 1.0).unwrap();
+		let mut shaper = Shaper::new(fonts);
+
+		// Create a snapshot with mixed LTR and RTL text
+		let mut snapshot = Snapshot::new(14, 1);
+		let text = "Hello مرحبا ok";
+		let mut cell_index = 0;
+		for ch in text.chars() {
+			if cell_index < snapshot.cells.len() {
+				snapshot.cells[cell_index] = Square::from_char(ch);
+				cell_index += 1;
+			}
+		}
+
+		let palette = Palette::default();
+		let mut grid = Grid::new(14, 1);
+		grid.fill(&snapshot, &palette, &GridOptions::default());
+
+		let row_layout = shaper.row(&grid, 0);
+
+		assert!(
+			!row_layout.bidirectional_runs.is_empty(),
+			"bidi_runs should not be empty"
+		);
+		assert!(!row_layout.text.is_empty(), "row_text should not be empty");
+
+		// Debug output
+		eprintln!("row_text: {:?}", row_layout.text);
+		eprintln!("bidi_runs: {:?}", row_layout.bidirectional_runs);
+
+		// There should be at least one RTL run for the Arabic text
+		let has_rtl = row_layout
+			.bidirectional_runs
+			.iter()
+			.any(|run| run.is_right_to_left);
+		assert!(has_rtl, "should have at least one RTL bidi run");
 	}
 }
