@@ -66,4 +66,5 @@ pub mod render;
 pub mod session;
 pub mod shape;
 pub mod simd;
+pub mod sprite;
 pub mod stream;

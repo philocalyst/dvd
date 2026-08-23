@@ -20,13 +20,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use dvd_render::encode::{mp4::Mp4, png::Png, svg::Svg};
 use dvd_render::fonts::Fonts;
 use dvd_render::model::{Palette, Snapshot};
 use dvd_render::render::{Renderer, Surface};
 use dvd_render::session::{Capture, Session};
-use dvd_render::stream::{Deduplicator, Encoder, Frame, MAXIMUM_QUEUE_DEPTH, Metadata, Sink};
-use dvd_render::{Level, rio_vt};
+use dvd_render::grid::GridOptions;
+use dvd_render::stream::{Deduplicator, Encoder, Frame, MAXIMUM_QUEUE_DEPTH, Metadata};
+use dvd_render::Level;
 use termwiz::terminal::Terminal as _;
 
 use crate::cli::Output;
@@ -146,33 +146,32 @@ fn run(config: RecordConfig) -> Result<()> {
 		.saturating_sub((chrome / metrics.cell_height) as u16)
 		.max(1);
 
-	let renderer = Renderer::new(fonts, palette.clone(), surface, columns, rows, level)?;
-	let (width, height) = renderer.size();
+	let options = GridOptions::default();
+	let renderer = Renderer::new(
+		fonts,
+		palette.clone(),
+		options,
+		surface,
+		columns,
+		rows,
+		level,
+	)?;
+	let canvas = renderer.size();
 
-	// Build the sinks — same helper as burn, just local because burn owns
-	// its own `sinks` fn.
-	let sinks: Vec<Box<dyn Sink>> = config
-		.outputs
-		.iter()
-		.map(|(path, format)| -> Box<dyn Sink> {
-			match format {
-				Output::Png => Box::new(Png::new(path.clone())),
-				Output::Mp4 => Box::new(Mp4::new(
-					path.clone(),
-					level,
-					palette.named(rio_vt::config::colors::NamedColor::Background),
-				)),
-				Output::Svg => Box::new(Svg::new(
-					path.clone(),
-					renderer.metrics(),
-					surface,
-					palette.clone(),
-					font_family.clone(),
-					font_size,
-				)),
-			}
-		})
-		.collect();
+	// The same builder `burn` uses. This was a second copy of the `match`,
+	// which meant every change to a sink's constructor had to be made twice.
+	let sinks = crate::burn::Outputs {
+		font_family: Some(font_family),
+		font_size,
+		line_height: 1.0,
+		palette: palette.clone(),
+		options,
+		surface,
+		columns,
+		rows,
+		level,
+	}
+	.sinks(&config.outputs)?;
 
 	// Open the session: a real PTY with a real shell, sized to the inherited
 	// terminal.
@@ -194,8 +193,8 @@ fn run(config: RecordConfig) -> Result<()> {
 
 	let played = config.framerate.clamp(1, u8::MAX as u32) as u8;
 	let meta = Metadata {
-		width,
-		height,
+		width: canvas.width,
+		height: canvas.height,
 		frames_per_second: played,
 	};
 

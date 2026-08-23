@@ -100,7 +100,9 @@ impl Grid {
 		self.graphics.clear();
 		self.graphics.extend(snapshot.graphics.iter().cloned());
 
-		self.cursor = Caret::resolve(snapshot, palette);
+		// After the cells, because the caret's width is a property of the
+		// character underneath it.
+		self.cursor = Caret::resolve(snapshot, &self.cells, self.columns, palette);
 	}
 
 	pub fn cell(&self, at: Cell) -> &ResolvedCell {
@@ -164,14 +166,12 @@ impl Grid {
 		// The cursor is not baked into any cell's `ResolvedCell` — it is an
 		// overlay applied at paint time — so a caret that moved across two
 		// otherwise-identical cells would be invisible to the loop above.
-		// Both the cell it left and the cell it entered have to be touched
-		// by hand.
+		// Both the cells it left and the cells it entered have to be touched
+		// by hand, and "cells" is plural: a caret on a wide character covers
+		// two columns and leaves two behind.
 		if self.cursor != previous.cursor {
-			if let Some(caret) = self.cursor {
-				touch(&mut rows, caret.at);
-			}
-			if let Some(caret) = previous.cursor {
-				touch(&mut rows, caret.at);
+			for caret in [self.cursor, previous.cursor].into_iter().flatten() {
+				touch(&mut rows, caret.span());
 			}
 		}
 
@@ -183,33 +183,71 @@ impl Grid {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caret {
 	pub at: Cell,
+	/// How many columns the cursor covers — two when it sits on a
+	/// double-width character.
+	///
+	/// A caret is a highlight of *the character under it*, not of a fixed
+	/// slice of the grid. On a CJK character a one-column block cursor covers
+	/// its left half and leaves the right half showing through, which reads as
+	/// a rendering fault rather than as a cursor. Every terminal that handles
+	/// wide characters at all widens the caret to match, and it has to be
+	/// decided here rather than at paint time because the damage diff needs
+	/// the same answer.
+	pub columns: u16,
 	pub shape: CursorShape,
 	pub color: Color,
 	/// Ink for the glyph the cursor sits on, when the shape covers it.
 	///
 	/// Computed by [`Color::contrasting`] rather than by inverting the cell:
-	/// see `render.rs::cell_foreground` for the mid-grey cursor a plain
-	/// inversion gets wrong. Only a block cursor actually paints over the
-	/// glyph, but the colour costs nothing to compute for the other shapes
-	/// and it means the painter never has to ask the palette itself.
+	/// inverting a mid-grey cursor produces another mid-grey, and the glyph
+	/// vanishes. Only a block cursor actually paints over the glyph, but the
+	/// colour costs nothing to compute for the other shapes and it means the
+	/// painter never has to ask the palette itself.
 	pub text: Color,
 }
 
 impl Caret {
-	fn resolve(snapshot: &Snapshot, palette: &Palette) -> Option<Self> {
+	/// The run of cells the caret covers.
+	#[inline]
+	pub fn span(self) -> Span {
+		Span::new(self.at.row, self.at.column, self.at.column + self.columns)
+	}
+
+	fn resolve(snapshot: &Snapshot, cells: &[ResolvedCell], columns: u16, palette: &Palette) -> Option<Self> {
 		if !snapshot.cursor_visible || snapshot.cursor.content == CursorShape::Hidden {
 			return None;
 		}
 
 		let column = snapshot.cursor.pos.col.0 as u32;
 		let row = snapshot.cursor.pos.row.0.max(0) as u32;
-		if column >= snapshot.columns as u32 || row >= snapshot.screen_rows as u32 {
+		if column >= columns as u32 || row >= snapshot.screen_rows as u32 {
 			return None;
 		}
 
+		let (mut column, row) = (column as u16, row as u16);
+		let index = |column: u16| row as usize * columns as usize + column as usize;
+
+		// A cursor reported on the second half of a wide character belongs to
+		// the character, not to the placeholder: drawn where the terminal
+		// literally said, it straddles the boundary and highlights the right
+		// half of one character and the left half of the next.
+		if cells
+			.get(index(column))
+			.is_some_and(|cell| cell.wide == Wide::Spacer)
+			&& column > 0
+		{
+			column -= 1;
+		}
+
+		let width = match cells.get(index(column)).map(|cell| cell.wide) {
+			Some(Wide::Wide) => 2,
+			_ => 1,
+		};
+
 		let color = palette.named(NamedColor::Cursor);
 		Some(Self {
-			at: Cell::new(column as u16, row as u16),
+			at: Cell::new(column, row),
+			columns: width,
 			shape: snapshot.cursor.content,
 			color,
 			text: color.contrasting(),
@@ -286,16 +324,16 @@ fn row_span(row: u16, current: &[ResolvedCell], previous: &[ResolvedCell]) -> Op
 	}
 }
 
-/// Widen a row's damage span to cover `at`, or start one of width one.
-fn touch(rows: &mut [Option<Span>], at: Cell) {
-	if let Some(slot) = rows.get_mut(at.row as usize) {
+/// Widen a row's damage to cover `covered`, starting a run if it had none.
+fn touch(rows: &mut [Option<Span>], covered: Span) {
+	if let Some(slot) = rows.get_mut(covered.row as usize) {
 		*slot = Some(match *slot {
 			Some(span) => Span::new(
-				at.row,
-				span.start.min(at.column),
-				span.end.max(at.column + 1),
+				covered.row,
+				span.start.min(covered.start),
+				span.end.max(covered.end),
 			),
-			None => Span::cell(at),
+			None => covered,
 		});
 	}
 }

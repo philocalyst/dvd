@@ -30,6 +30,7 @@ use dvd_render::encode::{mp4::Mp4, png::Png, svg::Svg};
 use dvd_render::fonts::Fonts;
 use dvd_render::geom::Color;
 use dvd_render::model::{Palette, Snapshot};
+use dvd_render::grid::GridOptions;
 use dvd_render::render::{Renderer, Surface};
 use dvd_render::session::{Capture, Session};
 use dvd_render::stream::{Deduplicator, Encoder, Frame, MAXIMUM_QUEUE_DEPTH, Metadata, Sink};
@@ -249,41 +250,67 @@ fn plan(commands: Vec<Commands>) -> Result<Plan> {
 	Ok(plan)
 }
 
-/// Build the sinks for a set of output paths.
+/// Everything the sinks need that is not the path they write to.
 ///
-/// The format for each path already came from the tape's `Output` command (or
-/// from the CLI's own `--output`, validated by clap before this ever runs) —
-/// re-deriving it from the extension a second time would just be two places
-/// that can disagree about what `.gif` means.
-fn sinks(
-	outputs: &[(PathBuf, Output)],
-	renderer: &Renderer,
-	fonts: &Fonts,
-	palette: &Palette,
-	surface: Surface,
-	level: Level,
-) -> Vec<Box<dyn Sink>> {
-	outputs
-		.iter()
-		.map(|(path, format)| -> Box<dyn Sink> {
-			match format {
-				Output::Png => Box::new(Png::new(path.clone())),
-				Output::Mp4 => Box::new(Mp4::new(
-					path.clone(),
-					level,
-					palette.named(rio_vt::config::colors::NamedColor::Background),
-				)),
-				Output::Svg => Box::new(Svg::new(
-					path.clone(),
-					renderer.metrics(),
-					surface,
-					palette.clone(),
-					fonts.family.clone(),
-					fonts.size,
-				)),
-			}
-		})
-		.collect()
+/// Grouped rather than passed as nine parameters because every field is a
+/// property of *the recording*, decided once before any thread starts, and a
+/// sink either needs the whole picture or none of it. Shared with `record.rs`,
+/// which was carrying a second copy of the same `match` — one that had to be
+/// kept in step by hand every time a sink's constructor changed.
+pub(crate) struct Outputs {
+	pub font_family: Option<String>,
+	pub font_size: f32,
+	pub line_height: f32,
+	pub palette: Palette,
+	pub options: GridOptions,
+	pub surface: Surface,
+	pub columns: u16,
+	pub rows: u16,
+	pub level: Level,
+}
+
+impl Outputs {
+	/// A font database of its own.
+	///
+	/// `Fonts` owns a `FontContext` that shaping mutates, and the renderer
+	/// already holds one. Resolving a second time is a one-off startup cost;
+	/// sharing a single context would mean a lock on the hottest path in the
+	/// pipeline.
+	fn fonts(&self) -> Result<Fonts> {
+		Fonts::resolve(self.font_family.as_deref(), self.font_size, self.line_height)
+	}
+
+	/// Build the sinks for a set of output paths.
+	///
+	/// The format for each path already came from the tape's `Output` command
+	/// (or from the CLI's own `--output`, validated by clap before this ever
+	/// runs) — re-deriving it from the extension a second time would just be
+	/// two places that can disagree about what `.gif` means.
+	pub(crate) fn sinks(&self, outputs: &[(PathBuf, Output)]) -> Result<Vec<Box<dyn Sink>>> {
+		outputs
+			.iter()
+			.map(|(path, format)| -> Result<Box<dyn Sink>> {
+				Ok(match format {
+					Output::Png => Box::new(Png::new(path.clone())),
+					Output::Mp4 => Box::new(Mp4::new(
+						path.clone(),
+						self.level,
+						self.palette
+							.named(rio_vt::config::colors::NamedColor::Background),
+					)),
+					Output::Svg => Box::new(Svg::new(
+						path.clone(),
+						self.fonts()?,
+						self.palette.clone(),
+						self.options,
+						self.surface,
+						self.columns,
+						self.rows,
+					)),
+				})
+			})
+			.collect()
+	}
 }
 
 /// `dvd burn`: run a tape and write every output it names.
@@ -387,22 +414,35 @@ fn record(plan: Plan) -> Result<()> {
 		.unwrap_or(0)
 		.clamp(1, u16::MAX as u32) as u16;
 
-	let renderer = Renderer::new(fonts, palette.clone(), surface, columns, rows, level)?;
-	let (width, height) = renderer.size();
+	// How cells resolve, decided once for the whole recording and handed to
+	// every backend. Before this it was `GridOptions::default()` hardcoded at
+	// four separate call sites inside the renderer, which meant the setting
+	// existed but could not be observed.
+	let options = GridOptions::default();
 
-	let fonts_for_svg = Fonts::resolve(
-		settings.font_family.as_deref(),
-		settings.font_size,
-		settings.line_height,
-	)?;
-	let sinks = sinks(
-		&outputs,
-		&renderer,
-		&fonts_for_svg,
-		&palette,
+	let renderer = Renderer::new(
+		fonts,
+		palette.clone(),
+		options,
 		surface,
+		columns,
+		rows,
 		level,
-	);
+	)?;
+	let canvas = renderer.size();
+
+	let sinks = Outputs {
+		font_family: settings.font_family.clone(),
+		font_size: settings.font_size,
+		line_height: settings.line_height,
+		palette: palette.clone(),
+		options,
+		surface,
+		columns,
+		rows,
+		level,
+	}
+	.sinks(&outputs)?;
 
 	let session = Session::open(
 		&settings.shell,
@@ -434,8 +474,8 @@ fn record(plan: Plan) -> Result<()> {
 		.clamp(1.0, u8::MAX as f32) as u8;
 
 	let meta = Metadata {
-		width,
-		height,
+		width: canvas.width,
+		height: canvas.height,
 		frames_per_second: played,
 	};
 

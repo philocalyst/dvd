@@ -1,14 +1,13 @@
-//! The paint pass: one reduction from model to shapes, backends that receive
-//! it.
+//! One reduction from model to shapes, and the backends that receive it.
 //!
-//! Before this module existed, `render.rs` and `encode/svg.rs` were two
-//! independent implementations of the same drawing. Background runs, cursor
-//! geometry, decorations and wide-cell handling were each written twice, and
-//! they already disagreed — the SVG had no bidirectional reordering, no
-//! combining marks, and distorting glyph shapes with
-//! `lengthAdjust="spacingAndGlyphs"`. The fix is not to maintain them better
-//! in step; it is to have one place that decides what a frame *is*, and hand
-//! that decision to both backends. [`paint`] is that place.
+//! `render.rs` and `encode/svg.rs` were two independent implementations of the
+//! same drawing. Background runs, cursor geometry, decorations and wide-cell
+//! handling were each written twice, and they had already drifted — the SVG
+//! had no bidirectional reordering and no combining marks, the rasterizer
+//! resolved every cell's palette four separate times per row, and each carried
+//! its own copy of the shaping and outline caches. The fix is not to maintain
+//! them better in step; it is to have one place that decides what a frame *is*
+//! and hand that decision to both. [`paint`] is that place.
 //!
 //! Paint order is a terminal's, and it is load-bearing:
 //!
@@ -18,23 +17,33 @@
 //! 4. the cursor — a block cursor is a *background*, painted before the
 //!    glyphs, which is why the glyph on top is recoloured rather than the
 //!    cell inverted
-//! 5. glyphs
-//! 6. underlines and strikethroughs
-//! 7. graphics with non-negative `z`
+//! 5. drawn characters (box drawing, blocks, braille — see [`crate::sprite`])
+//! 6. glyphs
+//! 7. underlines and strikethroughs
+//! 8. graphics with non-negative `z`
 //!
 //! A [`Painter`] that only wants changed cells passes a real [`Damage`]; one
-//! that wants the whole frame passes [`Damage::everything`]. The mechanism is
-//! correct even when `Renderer` passes `Damage::everything` every frame for
-//! now — what matters is that skipping untouched cells works when someone
-//! asks for it.
+//! that wants the whole frame passes [`Damage::everything`].
+//!
+//! ## Why the shaper is borrowed twice
+//!
+//! [`paint`] takes the shaper and the outline cache separately, and asks the
+//! shaper for a [`RowKey`] before asking for the layout. Both are forced by the
+//! borrow checker and both are load-bearing: a painter drawing outlines needs
+//! the layout *and* the faces at the same time, which a single
+//! `&mut self -> &RowLayout` call makes impossible. See [`crate::shape`].
 
 use rio_vt::ansi::CursorShape;
 use rio_vt::crosswords::style::StyleFlags;
+use vello_cpu::kurbo::BezPath;
 
-use crate::geom::{Cell, Color, Frame, PixelRect, Span};
+use crate::geom::{Cell, Color, Frame, PixelRect, Point, Span};
 use crate::grid::{Caret, Damage, Grid};
-use crate::model::Placement;
-use crate::shape::{GlyphRun, Shaper};
+use crate::model::{Placement, ResolvedCell};
+use crate::outline::{GlyphKey, Outlines};
+use crate::render::Surface;
+use crate::shape::{Faces, GlyphRun, RowLayout, Shaper};
+use crate::sprite::{self, Stroke, Underline, Weights};
 
 /// Anything that can receive the shapes one frame reduces to.
 ///
@@ -48,31 +57,38 @@ pub trait Painter {
 	/// Fill a solid rectangle.
 	fn fill(&mut self, rect: PixelRect, color: Color);
 
-	/// Fill a rectangle with rounded corners. Used for the panel and for
-	/// any margin fill the surface carries.
+	/// Fill a rectangle with rounded corners. Used for the panel and for any
+	/// margin fill the surface carries.
 	fn rounded_fill(&mut self, rect: PixelRect, radius: f32, color: Color);
 
-	/// Draw a run of glyphs sharing a colour and a set of attributes.
+	/// Fill a path, in canvas coordinates.
 	///
-	/// The origin is the canvas position of the row's top-left corner; each
-	/// glyph's `x`/`y` is relative to it. A backend that emits text rather
-	/// than outlines can read `run.text` for the source characters.
-	fn glyphs(&mut self, run: GlyphRun<'_>, origin: (f32, f32));
+	/// Only the drawn shapes that are not rectangles reach this — rounded box
+	/// corners, diagonals and undercurls. A *fill* rather than a stroke
+	/// because it is the one operation both backends perform identically:
+	/// `vello_cpu` fills, an SVG `<path>` with no `stroke` fills, and neither
+	/// has to agree about how a stroke is expanded or capped.
+	fn path(&mut self, path: &BezPath, color: Color);
+
+	/// Draw a run of glyphs sharing a colour, a set of attributes and a
+	/// direction. See [`GlyphRun`] for what a backend may read off it.
+	fn glyphs(&mut self, run: GlyphRun<'_>, origin: Point, context: &Text<'_>);
 
 	/// Composite a placed image, clipped to `clip`.
-	///
-	/// May be a no-op stub for now — a later workstream implements graphics
-	/// compositing — but the call must be made in the right place in the
-	/// paint order and the trait method must exist with the right shape.
 	fn image(&mut self, placement: &Placement, clip: PixelRect);
 }
 
-/// How decorations (underlines, strikethroughs) are drawn.
-#[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
-struct Decoration {
-	rect: PixelRect,
-	color: Color,
+/// The read-only text machinery a painter needs to turn a [`GlyphRun`] into
+/// ink.
+///
+/// Bundled into one borrow rather than passed as three parameters, because
+/// the set is fixed and every backend that draws glyphs at all needs the
+/// whole of it: the faces to resolve a glyph back to its file, the outlines
+/// to get its shape, and the size the outlines were extracted at.
+pub struct Text<'a> {
+	pub faces: &'a Faces,
+	pub outlines: &'a Outlines,
+	pub size: f32,
 }
 
 /// Draw one frame into a painter.
@@ -82,18 +98,19 @@ pub fn paint(
 	grid: &Grid,
 	damage: &Damage,
 	shaper: &mut Shaper,
+	outlines: &mut Outlines,
 	frame: &Frame,
-	surface: &crate::render::Surface,
+	surface: &Surface,
 	painter: &mut impl Painter,
 ) {
 	// 1. Canvas fill and panel — only on a full redraw. When the damage is
-	// partial, the panel is already on screen from the previous frame;
+	// partial the panel is already on screen from the previous frame, and
 	// repainting it would cover the cells that were not redrawn.
 	if damage.is_everything() {
 		if let Some(fill) = surface.margin_fill {
 			painter.fill(frame.canvas_rect(), fill);
 		}
-		let panel = crate::render::panel_rect(frame, surface);
+		let panel = surface.panel_rect(frame);
 		if surface.border_radius > 0 {
 			painter.rounded_fill(panel, surface.border_radius as f32, grid.background);
 		} else {
@@ -101,185 +118,323 @@ pub fn paint(
 		}
 	}
 
-	// 2. Cell backgrounds, merged into runs. `background_runs` skips the
-	// panel colour — painting it again would be a rectangle that changes
-	// nothing.
+	// 2. Cell backgrounds, merged into runs. `background_runs` skips the panel
+	// colour — painting it again would be a rectangle that changes nothing.
 	for row in damage.rows() {
 		for (span, color) in grid.background_runs(row.row) {
 			painter.fill(frame.span_rect(span), color);
 		}
 	}
 
-	// 3. Graphics with negative z (beneath the text).
-	for placement in &grid.graphics {
-		if placement.z < 0 {
-			let clip = frame.canvas_rect();
-			painter.image(placement, clip);
-		}
-	}
+	// 3. Graphics beneath the text.
+	paint_images(painter, grid, frame, |z| z < 0);
 
 	// 4. The cursor — a block cursor is a background, painted before the
-	// glyphs. The glyph on top is recoloured (`Caret::text`, already
-	// resolved) rather than the cell inverted.
+	// glyphs. The glyph on top is recoloured (`Caret::text`, already resolved)
+	// rather than the cell inverted.
 	if let Some(caret) = grid.cursor {
 		paint_cursor(painter, caret, frame);
 	}
 
-	// 5. Glyphs. Shaped per row, drawn per run of shared colour.
+	// 5 and 6. Drawn characters and shaped ones, row by row. Both walk the
+	// same damaged rows, and the sprite pass goes first so a drawn character
+	// never lands on top of a glyph that overhangs into its cell.
+	let weights = Weights::from_thickness(frame.metrics.underline_thickness);
+	let mut strokes = Vec::new();
+
 	for row in damage.rows() {
-		let layout = shaper.row(grid, row.row);
+		paint_sprites(painter, grid, row, frame, weights, &mut strokes);
+
+		let key = shaper.ensure_row(grid, row.row);
+		let layout = shaper.layout(key);
 		if layout.glyphs.is_empty() {
 			continue;
 		}
-		paint_glyphs(painter, layout, grid, row, frame);
-	}
 
-	// 6. Underlines and strikethroughs.
-	for row in damage.rows() {
-		paint_decorations(painter, grid, row, frame);
-	}
-
-	// 7. Graphics with non-negative z (over the text).
-	for placement in &grid.graphics {
-		if placement.z >= 0 {
-			let clip = frame.canvas_rect();
-			painter.image(placement, clip);
+		// Outlines are extracted before the run walk rather than during it:
+		// `ensure` needs `&mut outlines` and the walk hands out `&outlines`,
+		// and doing it here also means a painter never has to own the
+		// extraction path itself.
+		for glyph in &layout.glyphs {
+			if let Some(face) = shaper.faces().get(glyph.font) {
+				outlines.ensure(
+					GlyphKey {
+						font: glyph.font.0,
+						glyph: glyph.identifier,
+					},
+					face,
+					shaper.size(),
+				);
+			}
 		}
+
+		let context = Text {
+			faces: shaper.faces(),
+			outlines,
+			size: shaper.size(),
+		};
+		paint_glyphs(painter, layout, grid, row, frame, &context);
+	}
+
+	// 7. Underlines and strikethroughs, over the glyphs they belong to.
+	for row in damage.rows() {
+		paint_decorations(painter, grid, row, frame, &mut strokes);
+	}
+
+	// 8. Graphics over the text.
+	paint_images(painter, grid, frame, |z| z >= 0);
+}
+
+fn paint_images(
+	painter: &mut impl Painter,
+	grid: &Grid,
+	frame: &Frame,
+	wanted: impl Fn(i32) -> bool,
+) {
+	let clip = frame.canvas_rect();
+	for placement in grid.graphics.iter().filter(|p| wanted(p.z)) {
+		painter.image(placement, clip);
 	}
 }
 
-/// Paint the cursor, respecting its shape.
+/// Paint the cursor, respecting its shape and the width of what it sits on.
 fn paint_cursor(painter: &mut impl Painter, caret: Caret, frame: &Frame) {
-	let rect = frame.cell_rect(caret.at);
+	let rect = frame.span_rect(caret.span());
 	let thickness = (frame.metrics.underline_thickness * 1.5).round().max(2.0);
 
-	match caret.shape {
-		CursorShape::Block => {
-			// The full cell — the glyph on top is recoloured by the
-			// shaper/painter using `caret.text`.
-			painter.fill(rect, caret.color);
-		}
+	let shape = match caret.shape {
+		// The full run — two columns when the caret is on a wide character.
+		CursorShape::Block => rect,
 		CursorShape::Underline => {
-			painter.fill(
-				PixelRect::new(rect.x, rect.bottom() - thickness, rect.width, thickness),
-				caret.color,
-			);
+			PixelRect::new(rect.x, rect.bottom() - thickness, rect.width, thickness)
 		}
-		CursorShape::Beam => {
-			painter.fill(
-				PixelRect::new(rect.x, rect.y, thickness, rect.height),
-				caret.color,
-			);
+		// A beam marks an insertion point, which is a position rather than a
+		// character, so it stays one stroke wide over a wide cell.
+		CursorShape::Beam => PixelRect::new(rect.x, rect.y, thickness, rect.height),
+		CursorShape::Hidden => return,
+	};
+
+	painter.fill(shape.snapped(), caret.color);
+}
+
+/// Draw the characters the grid renders itself, cell by cell.
+fn paint_sprites(
+	painter: &mut impl Painter,
+	grid: &Grid,
+	row: Span,
+	frame: &Frame,
+	weights: Weights,
+	strokes: &mut Vec<Stroke>,
+) {
+	let cells = grid.row(row.row);
+
+	for column in row.start..row.end.min(grid.columns) {
+		let cell = &cells[column as usize];
+		if !sprite::covers(cell.character) {
+			continue;
 		}
-		CursorShape::Hidden => {}
+
+		strokes.clear();
+		let at = Cell::new(column, row.row);
+		if !sprite::draw(cell.character, frame.cell_rect(at), weights, strokes) {
+			continue;
+		}
+
+		let color = ink(grid, cell, at);
+		emit(painter, strokes, color);
 	}
 }
 
-/// Paint one row's glyphs, grouped into runs of shared colour.
+/// Hand a batch of drawn strokes to the painter in one colour.
+fn emit(painter: &mut impl Painter, strokes: &[Stroke], color: Color) {
+	for stroke in strokes {
+		match stroke {
+			Stroke::Rect { rect, alpha } => painter.fill(*rect, color.with_alpha(*alpha)),
+			Stroke::Path { path, alpha } => painter.path(path, color.with_alpha(*alpha)),
+		}
+	}
+}
+
+/// Paint one row's glyphs, grouped into runs that share everything a backend
+/// would have to change state for.
+///
+/// A run breaks on colour, on attributes, and on bidirectional direction. The
+/// first two are what a rasterizer cares about; the third is what a backend
+/// emitting text cares about, and putting all three here is what keeps the two
+/// from splitting runs differently and drawing different pictures.
 fn paint_glyphs(
 	painter: &mut impl Painter,
-	layout: &crate::shape::RowLayout,
+	layout: &RowLayout,
 	grid: &Grid,
-	row_span: Span,
+	row: Span,
 	frame: &Frame,
+	context: &Text<'_>,
 ) {
-	let origin = frame.cell_origin(Cell::new(0, row_span.row));
-	let cells = grid.row(row_span.row);
+	let origin = frame.row_origin(row.row);
+	let cells = grid.row(row.row);
+	let last_column = cells.len().saturating_sub(1);
+
+	let attributes = |column: u16| {
+		let cell = &cells[(column as usize).min(last_column)];
+		let at = Cell::new(column, row.row);
+		(ink(grid, cell, at), cell.flags)
+	};
 
 	let mut start = 0usize;
 	while start < layout.glyphs.len() {
-		let column = layout.glyphs[start].column as usize;
-		let cell = &cells[column.min(cells.len().saturating_sub(1))];
-		let color = cursor_text(grid, cell, layout.glyphs[start].column, row_span.row)
-			.unwrap_or(cell.foreground);
-		let flags = cell.flags;
+		let (color, flags) = attributes(layout.glyphs[start].column);
+		let direction = direction_at(layout, layout.glyphs[start].column);
 
 		let mut end = start + 1;
 		while end < layout.glyphs.len() {
-			let next_column = layout.glyphs[end].column as usize;
-			let next_cell = &cells[next_column.min(cells.len().saturating_sub(1))];
-			let next_color = cursor_text(grid, next_cell, layout.glyphs[end].column, row_span.row)
-				.unwrap_or(next_cell.foreground);
-			if next_color != color || next_cell.flags != flags {
+			let column = layout.glyphs[end].column;
+			if attributes(column) != (color, flags) || direction_at(layout, column) != direction {
 				break;
 			}
 			end += 1;
 		}
 
-		let span = Span::new(
-			row_span.row,
-			layout.glyphs[start].column,
-			layout.glyphs[end.saturating_sub(1)].column + 1,
-		);
 		let glyphs = &layout.glyphs[start..end];
-		let text = &layout.text;
+		let first_column = glyphs[0].column;
+		let final_column = glyphs[glyphs.len() - 1].column;
+		// A run ending on a double-width character covers both of its
+		// columns. Measuring the span by column count alone would make the
+		// run one cell narrow, which a backend sizing markup off it turns
+		// into every CJK line squeezed to the left.
+		let final_width = match cells.get(final_column as usize).map(|cell| cell.wide) {
+			Some(rio_vt::crosswords::square::Wide::Wide) => 2,
+			_ => 1,
+		};
 
 		painter.glyphs(
 			GlyphRun {
-				span,
+				span: Span::new(row.row, first_column, final_column + final_width),
 				glyphs,
-				text,
+				text: &layout.text,
+				range: byte_range(layout, first_column, final_column),
+				columns: &layout.column_by_byte_index,
 				color,
 				flags,
+				right_to_left: direction,
 			},
 			origin,
+			context,
 		);
 
 		start = end;
 	}
 }
 
-/// The colour a glyph is drawn in, accounting for the cursor sitting on it.
-///
-/// A block cursor paints over the cell, so the glyph underneath has to be
-/// re-coloured or it disappears into the cursor. `Caret::text` is already
-/// resolved by `Color::contrasting`, so this is a lookup rather than a
-/// computation.
-fn cursor_text(
-	grid: &Grid,
-	_cell: &crate::model::ResolvedCell,
-	column: u16,
-	row: u16,
-) -> Option<Color> {
-	let caret = grid.cursor?;
-	if caret.shape != CursorShape::Block {
-		return None;
-	}
-	if caret.at.column != column || caret.at.row != row {
-		return None;
-	}
-	Some(caret.text)
+/// Whether the bidirectional run covering a column runs right to left.
+fn direction_at(layout: &RowLayout, column: u16) -> bool {
+	layout
+		.column_by_byte_index
+		.iter()
+		.position(|&at| at == column)
+		.and_then(|byte| {
+			layout
+				.bidirectional_runs
+				.iter()
+				.find(|run| byte >= run.start && byte < run.end)
+		})
+		.is_some_and(|run| run.right_to_left)
 }
 
-/// Paint underlines and strikethroughs for a row, as rectangles.
+/// The byte range of `text` spanning two columns inclusive.
+fn byte_range(layout: &RowLayout, first: u16, last: u16) -> std::ops::Range<usize> {
+	let start = layout
+		.column_by_byte_index
+		.iter()
+		.position(|&column| column == first)
+		.unwrap_or(0);
+	let end = layout
+		.column_by_byte_index
+		.iter()
+		.rposition(|&column| column == last)
+		.map_or(start, |index| index + 1);
+
+	start..end.max(start)
+}
+
+/// The colour a cell's ink is drawn in, accounting for a block cursor sitting
+/// on top of it.
 ///
-/// Rectangles rather than the font's own decoration glyphs because a run
-/// spanning several cells has to be continuous across them, and because the
-/// thickness has to land on whole pixels to stay crisp at recording sizes.
-fn paint_decorations(painter: &mut impl Painter, grid: &Grid, row_span: Span, frame: &Frame) {
-	let cells = grid.row(row_span.row);
+/// A block cursor paints over the cell, so whatever is underneath has to be
+/// recoloured or it disappears into the caret. `Caret::text` is already
+/// resolved by `Color::contrasting`, so this is a lookup rather than a
+/// computation.
+fn ink(grid: &Grid, cell: &ResolvedCell, at: Cell) -> Color {
+	match grid.cursor {
+		Some(caret)
+			if caret.shape == CursorShape::Block
+				&& caret.at.row == at.row
+				&& caret.span().contains(at.column) =>
+		{
+			caret.text
+		}
+		_ => cell.foreground,
+	}
+}
+
+/// Paint underlines and strikethroughs for a row.
+///
+/// Merged into runs of one style and colour before being drawn. A rule under
+/// a word is one continuous stroke in a terminal, and drawing it as one
+/// rectangle per cell leaves a seam at every cell boundary once anti-aliasing
+/// has had its say — the same failure the sprite pass exists to prevent for
+/// box drawing.
+fn paint_decorations(
+	painter: &mut impl Painter,
+	grid: &Grid,
+	row: Span,
+	frame: &Frame,
+	strokes: &mut Vec<Stroke>,
+) {
+	let cells = grid.row(row.row);
 	let metrics = frame.metrics;
+	let end = row.end.min(grid.columns);
 
-	for column in row_span.start..row_span.end {
+	let decoration = |column: u16| {
 		let cell = &cells[column as usize];
-		let rect = frame.cell_rect(Cell::new(column, row_span.row));
-		let color = cell.underline.unwrap_or(cell.foreground);
+		(
+			Underline::from_flags(cell.flags),
+			cell.underline.unwrap_or(cell.foreground),
+			cell.flags.contains(StyleFlags::STRIKEOUT),
+			cell.foreground,
+		)
+	};
 
-		if cell.flags.intersects(StyleFlags::ALL_UNDERLINES) {
-			let top = rect.y + metrics.underline_offset;
-			painter.fill(
-				PixelRect::new(rect.x, top, rect.width, metrics.underline_thickness),
-				color,
-			);
+	let mut column = row.start;
+	while column < end {
+		let (kind, color, struck, foreground) = decoration(column);
+		if kind.is_none() && !struck {
+			column += 1;
+			continue;
 		}
 
-		if cell.flags.contains(StyleFlags::STRIKEOUT) {
+		let mut last = column;
+		while last + 1 < end && decoration(last + 1) == (kind, color, struck, foreground) {
+			last += 1;
+		}
+
+		let span = Span::new(row.row, column, last + 1);
+		let rect = frame.span_rect(span);
+
+		if let Some(kind) = kind {
+			strokes.clear();
+			sprite::underline(kind, rect, &metrics, strokes);
+			emit(painter, strokes, color);
+		}
+
+		if struck {
 			let top = rect.y + metrics.strikeout_offset;
 			painter.fill(
-				PixelRect::new(rect.x, top, rect.width, metrics.strikeout_thickness),
-				cell.foreground,
+				PixelRect::new(rect.x, top, rect.width, metrics.strikeout_thickness).snapped(),
+				foreground,
 			);
 		}
+
+		column = last + 1;
 	}
 }
 
@@ -287,121 +442,166 @@ fn paint_decorations(painter: &mut impl Painter, grid: &Grid, row_span: Span, fr
 mod tests {
 	use super::*;
 	use crate::fonts::Fonts;
-	use crate::geom::Frame;
+	use crate::geom::Size;
 	use crate::grid::{Grid, GridOptions};
 	use crate::model::{Palette, Snapshot};
-	use crate::render::Surface;
-	use crate::shape::Shaper;
-	use rio_vt::crosswords::square::Square;
+	use rio_vt::config::colors::{AnsiColor, ColorRgb};
+	use rio_vt::crosswords::square::{Square, Wide};
+	use rio_vt::crosswords::style::Style;
 
-	/// A test double that records every call it receives, so a test can
-	/// assert paint order and run merging without reading pixels.
+	/// Records every call it receives, so a test can assert paint order and
+	/// run merging without reading pixels.
 	#[derive(Default)]
-	struct RecordPainter {
+	struct Record {
 		calls: Vec<&'static str>,
+		fills: Vec<(PixelRect, Color)>,
+		runs: Vec<(Span, Color, bool)>,
 	}
 
-	impl Painter for RecordPainter {
-		fn fill(&mut self, _rect: PixelRect, _color: Color) {
+	impl Record {
+		fn first_index(&self, call: &str) -> Option<usize> {
+			self.calls.iter().position(|seen| *seen == call)
+		}
+
+		fn count(&self, call: &str) -> usize {
+			self.calls.iter().filter(|seen| **seen == call).count()
+		}
+	}
+
+	impl Painter for Record {
+		fn fill(&mut self, rect: PixelRect, color: Color) {
 			self.calls.push("fill");
+			self.fills.push((rect, color));
 		}
 		fn rounded_fill(&mut self, _rect: PixelRect, _radius: f32, _color: Color) {
 			self.calls.push("rounded_fill");
 		}
-		fn glyphs(&mut self, _run: GlyphRun<'_>, _origin: (f32, f32)) {
+		fn path(&mut self, _path: &BezPath, _color: Color) {
+			self.calls.push("path");
+		}
+		fn glyphs(&mut self, run: GlyphRun<'_>, _origin: Point, _context: &Text<'_>) {
 			self.calls.push("glyphs");
+			self.runs.push((run.span, run.color, run.right_to_left));
 		}
 		fn image(&mut self, _placement: &Placement, _clip: PixelRect) {
 			self.calls.push("image");
 		}
 	}
 
-	fn make_frame(columns: u16, rows: u16, fill: char) -> (Grid, Shaper, Frame, Surface) {
-		let fonts = Fonts::resolve(Some("Liberation Mono"), 16.0, 1.0).unwrap();
-		let metrics = fonts.metrics;
-		let palette = Palette::default();
-		let surface = Surface {
-			margin: 0,
-			padding: 0,
-			border_radius: 0,
-			margin_fill: None,
-		};
-		let frame = Frame::new(
-			metrics,
-			(0.0, 0.0),
-			(
-				columns * metrics.cell_width as u16,
-				rows * metrics.cell_height as u16,
-			),
-		);
-		let shaper = Shaper::new(fonts);
-		let mut snapshot = Snapshot::new(columns, rows);
-		snapshot.cells.fill(Square::from_char(fill));
-		let mut grid = Grid::new(columns, rows);
-		grid.fill(&snapshot, &palette, &GridOptions::default());
-		(grid, shaper, frame, surface)
+	struct Harness {
+		grid: Grid,
+		shaper: Shaper,
+		outlines: Outlines,
+		frame: Frame,
+		surface: Surface,
+		palette: Palette,
 	}
 
-	/// A `Damage::everything` frame must paint the canvas/panel first, then
-	/// backgrounds, then glyphs. The panel is a `fill` (no border radius).
-	#[test]
-	fn paint_order_on_a_full_redraw_is_panel_then_backgrounds_then_glyphs() {
-		let (grid, mut shaper, frame, surface) = make_frame(4, 2, 'W');
-		let damage = Damage::everything(4, 2);
-		let mut painter = RecordPainter::default();
-		paint(&grid, &damage, &mut shaper, &frame, &surface, &mut painter);
+	impl Harness {
+		fn new(columns: u16, rows: u16) -> Self {
+			let fonts = Fonts::resolve(Some("Liberation Mono"), 16.0, 1.0).unwrap();
+			let metrics = fonts.metrics;
+			Self {
+				grid: Grid::new(columns, rows),
+				shaper: Shaper::new(fonts),
+				outlines: Outlines::new(),
+				frame: Frame::new(
+					metrics,
+					Point::ORIGIN,
+					Size::new(
+						columns * metrics.cell_width as u16,
+						rows * metrics.cell_height as u16,
+					),
+				),
+				surface: Surface {
+					margin: 0,
+					padding: 0,
+					border_radius: 0,
+					margin_fill: None,
+				},
+				palette: Palette::default(),
+			}
+		}
 
-		// The first call should be the panel fill (margin_fill is None, so
-		// no canvas fill; border_radius is 0, so it's a `fill` not a
-		// `rounded_fill`).
+		fn load(&mut self, snapshot: &Snapshot) {
+			self.grid
+				.fill(snapshot, &self.palette, &GridOptions::default());
+		}
+
+		fn run(&mut self, damage: &Damage) -> Record {
+			let mut painter = Record::default();
+			paint(
+				&self.grid,
+				damage,
+				&mut self.shaper,
+				&mut self.outlines,
+				&self.frame,
+				&self.surface,
+				&mut painter,
+			);
+			painter
+		}
+	}
+
+	fn screen(columns: u16, rows: u16, line: &str) -> Snapshot {
+		let mut snapshot = Snapshot::new(columns, rows);
+		snapshot.cells.fill(Square::from_char(' '));
+		for (index, character) in line.chars().take(columns as usize).enumerate() {
+			snapshot.cells[index] = Square::from_char(character);
+		}
+		snapshot
+	}
+
+	/// The order is the contract. Everything else in this module is an
+	/// implementation detail; this is the thing both backends rely on.
+	#[test]
+	fn a_full_redraw_paints_the_panel_then_backgrounds_then_glyphs() {
+		let mut harness = Harness::new(8, 2);
+		harness.load(&screen(8, 2, "Wide"));
+		let painter = harness.run(&Damage::everything(8, 2));
+
 		assert_eq!(
 			painter.calls.first(),
 			Some(&"fill"),
-			"panel must be painted first on a full redraw"
+			"the panel is painted first on a full redraw"
 		);
-		// Glyphs must come after backgrounds.
-		let first_glyph = painter.calls.iter().position(|c| *c == "glyphs");
+		let glyphs = painter
+			.first_index("glyphs")
+			.expect("a row of text must draw glyphs");
+		assert!(glyphs > 0, "backgrounds and panel come before glyphs");
+	}
+
+	/// A partial damage must not repaint the panel — doing so would cover
+	/// every cell the frame deliberately left alone.
+	#[test]
+	fn a_partial_damage_leaves_the_panel_alone() {
+		let mut harness = Harness::new(8, 2);
+		harness.load(&screen(8, 2, "        "));
+		let before = harness.grid.diff(None);
+		assert!(before.is_everything());
+
+		let mut changed = screen(8, 2, "        ");
+		changed.cells[3] = Square::from_char('X');
+
+		let mut previous = Grid::new(8, 2);
+		previous.fill(&screen(8, 2, "        "), &harness.palette, &GridOptions::default());
+		harness.load(&changed);
+		let damage = harness.grid.diff(Some(&previous));
+
+		let painter = harness.run(&damage);
+		assert_eq!(painter.count("rounded_fill"), 0);
 		assert!(
-			first_glyph.is_some(),
-			"glyphs must be painted for a row of text"
-		);
-		let last_fill_before_glyphs = painter
-			.calls
-			.iter()
-			.take(first_glyph.unwrap())
-			.rposition(|c| *c == "fill");
-		assert!(
-			last_fill_before_glyphs.is_some(),
-			"backgrounds must be painted before glyphs"
+			!damage.is_everything(),
+			"one changed cell is not a full redraw"
 		);
 	}
 
-	/// A row of identical backgrounds must become one `fill` rather than
-	/// eighty — this is what `background_runs` merging is for.
+	/// A row of one background colour must become one rectangle, not eighty.
 	#[test]
-	fn a_row_of_identical_backgrounds_becomes_one_fill() {
-		use rio_vt::config::colors::{AnsiColor, ColorRgb};
-		use rio_vt::crosswords::style::Style;
+	fn a_uniform_row_of_background_becomes_a_single_fill() {
+		let mut harness = Harness::new(8, 1);
 
-		let fonts = Fonts::resolve(Some("Liberation Mono"), 16.0, 1.0).unwrap();
-		let palette = Palette::default();
-		let surface = Surface {
-			margin: 0,
-			padding: 0,
-			border_radius: 0,
-			margin_fill: None,
-		};
-		let metrics = fonts.metrics;
-		let frame = Frame::new(
-			metrics,
-			(0.0, 0.0),
-			(8 * metrics.cell_width as u16, metrics.cell_height as u16),
-		);
-		let mut shaper = Shaper::new(fonts);
-
-		// A row where every cell has the same non-default background.
-		let mut snapshot = Snapshot::new(8, 1);
-		snapshot.cells.fill(Square::from_char(' '));
+		let mut snapshot = screen(8, 1, "        ");
 		snapshot.styles = vec![Style {
 			bg: AnsiColor::Spec(ColorRgb {
 				r: 100,
@@ -413,60 +613,180 @@ mod tests {
 		for cell in &mut snapshot.cells {
 			cell.set_style_id(0);
 		}
+		harness.load(&snapshot);
 
-		let mut grid = Grid::new(8, 1);
-		grid.fill(&snapshot, &palette, &GridOptions::default());
+		let painter = harness.run(&Damage::everything(8, 1));
 
-		let damage = Damage::everything(8, 1);
-		let mut painter = RecordPainter::default();
-		paint(&grid, &damage, &mut shaper, &frame, &surface, &mut painter);
-
-		// Count `fill` calls that are backgrounds (not the panel). The panel
-		// is the first fill; after that, one background fill for the whole
-		// row, then decoration fills (if any), then nothing else.
-		// The key assertion: the background is ONE fill, not eight.
-		let fill_count = painter.calls.iter().filter(|c| **c == "fill").count();
-		// Panel (1) + background (1) = at most 2 fills for an all-space row
-		// with no decorations. If there were no merging, it would be 9.
+		// Panel plus one merged background run. Eight would mean no merging.
 		assert!(
-			fill_count <= 2,
-			"a uniform row must be one background fill, not eight; got {fill_count} fills"
+			painter.count("fill") <= 2,
+			"expected the row to merge into one fill, got {} fills",
+			painter.count("fill")
 		);
 	}
 
-	/// A `Damage` covering one cell must produce calls for that cell only.
+	/// A block cursor on a double-width character has to cover both of its
+	/// columns. Covering one leaves the other half of the character showing
+	/// through the caret, which reads as a rendering fault.
 	#[test]
-	fn a_damage_covering_one_cell_produces_calls_for_that_cell_only() {
-		let (grid, mut shaper, frame, surface) = make_frame(8, 2, ' ');
+	fn a_block_cursor_covers_both_columns_of_a_wide_character() {
+		let mut harness = Harness::new(8, 1);
 
-		// Change one cell.
-		let mut snapshot = Snapshot::new(8, 2);
-		snapshot.cells.fill(Square::from_char(' '));
-		snapshot.cells[3] = Square::from_char('X');
-		let palette = Palette::default();
-		let mut new_grid = Grid::new(8, 2);
-		new_grid.fill(&snapshot, &palette, &GridOptions::default());
+		let mut snapshot = screen(8, 1, "        ");
+		let mut wide = Square::from_char('世');
+		wide.set_wide(Wide::Wide);
+		snapshot.cells[2] = wide;
+		let mut spacer = Square::from_char(' ');
+		spacer.set_wide(Wide::Spacer);
+		snapshot.cells[3] = spacer;
+		snapshot.cursor_visible = true;
+		snapshot.cursor.content = CursorShape::Block;
+		snapshot.cursor.pos.col = rio_vt::crosswords::pos::Column(2);
+		harness.load(&snapshot);
 
-		// Diff against the old grid.
-		let damage = new_grid.diff(Some(&grid));
+		let caret = harness.grid.cursor.expect("the cursor is visible");
+		assert_eq!(caret.columns, 2, "the caret widens to the character");
 
-		let mut painter = RecordPainter::default();
-		paint(
-			&new_grid,
-			&damage,
-			&mut shaper,
-			&frame,
-			&surface,
-			&mut painter,
+		let cell_width = harness.frame.metrics.cell_width as f32;
+		let painter = harness.run(&Damage::everything(8, 1));
+		let cursor_fill = painter
+			.fills
+			.iter()
+			.find(|(_, color)| *color == caret.color)
+			.expect("the caret must be painted");
+
+		assert_eq!(
+			cursor_fill.0.width,
+			cell_width * 2.0,
+			"the caret must span both columns"
 		);
+	}
 
-		// With only one cell changed, the panel must NOT be painted (it's
-		// not a full redraw). The only fills should be the one background
-		// (if any) and decorations for that one cell.
-		// No `rounded_fill` should appear — that's the panel path.
+	/// A caret reported on the trailing half of a wide character belongs to
+	/// the character. Drawn where the terminal literally said, it straddles
+	/// the boundary between two characters.
+	#[test]
+	fn a_cursor_on_a_spacer_snaps_back_to_the_character_it_belongs_to() {
+		let mut harness = Harness::new(8, 1);
+
+		let mut snapshot = screen(8, 1, "        ");
+		let mut wide = Square::from_char('世');
+		wide.set_wide(Wide::Wide);
+		snapshot.cells[4] = wide;
+		let mut spacer = Square::from_char(' ');
+		spacer.set_wide(Wide::Spacer);
+		snapshot.cells[5] = spacer;
+		snapshot.cursor_visible = true;
+		snapshot.cursor.content = CursorShape::Block;
+		snapshot.cursor.pos.col = rio_vt::crosswords::pos::Column(5);
+		harness.load(&snapshot);
+
+		let caret = harness.grid.cursor.expect("the cursor is visible");
+		assert_eq!(caret.at.column, 4, "the caret snaps back to the base cell");
+		assert_eq!(caret.columns, 2);
+	}
+
+	/// Box drawing is drawn rather than shaped, so it must reach the painter
+	/// as fills — and must not also arrive as a glyph, which would lay the
+	/// same ink down twice.
+	#[test]
+	fn box_drawing_arrives_as_drawn_fills_and_not_as_glyphs() {
+		let mut harness = Harness::new(4, 1);
+		harness.load(&screen(4, 1, "────"));
+
+		let painter = harness.run(&Damage::everything(4, 1));
+
+		assert_eq!(
+			painter.count("glyphs"),
+			0,
+			"a row of pure box drawing shapes nothing"
+		);
 		assert!(
-			!painter.calls.contains(&"rounded_fill"),
-			"panel must not be painted on a partial damage"
+			painter.count("fill") > 1,
+			"but it still puts rectangles on the canvas"
 		);
+	}
+
+	/// The underline styles have to survive the trip through the paint pass
+	/// as different shapes — a curl is a path, a plain rule is a rectangle.
+	#[test]
+	fn an_undercurl_reaches_the_painter_as_a_path() {
+		let mut harness = Harness::new(4, 1);
+
+		let mut snapshot = screen(4, 1, "abcd");
+		snapshot.styles = vec![Style {
+			flags: StyleFlags::UNDERCURL,
+			..Style::default()
+		}];
+		for cell in &mut snapshot.cells {
+			cell.set_style_id(0);
+		}
+		harness.load(&snapshot);
+
+		let painter = harness.run(&Damage::everything(4, 1));
+		assert_eq!(
+			painter.count("path"),
+			1,
+			"the whole underlined run is one curl"
+		);
+	}
+
+	/// A rule under a word is one stroke in a terminal. Drawing it per cell
+	/// leaves an anti-aliasing seam at every boundary.
+	#[test]
+	fn a_continuous_underline_is_merged_into_one_stroke() {
+		let mut harness = Harness::new(6, 1);
+
+		let mut snapshot = screen(6, 1, "abcdef");
+		snapshot.styles = vec![Style {
+			flags: StyleFlags::UNDERLINE,
+			..Style::default()
+		}];
+		for cell in &mut snapshot.cells {
+			cell.set_style_id(0);
+		}
+		harness.load(&snapshot);
+
+		let painter = harness.run(&Damage::everything(6, 1));
+		let cell_width = harness.frame.metrics.cell_width as f32;
+
+		let underline = painter
+			.fills
+			.iter()
+			.find(|(rect, _)| rect.width >= cell_width * 6.0)
+			.map(|(rect, _)| *rect);
+
+		assert!(
+			underline.is_some(),
+			"six underlined cells should merge into one rule, got fills {:?}",
+			painter.fills.iter().map(|(rect, _)| rect.width).collect::<Vec<_>>()
+		);
+	}
+
+	/// Glyph runs break where a backend would have to change state. Two
+	/// differently coloured words must not arrive as one run.
+	#[test]
+	fn a_colour_change_breaks_a_glyph_run() {
+		let mut harness = Harness::new(6, 1);
+
+		let mut snapshot = screen(6, 1, "abcdef");
+		snapshot.styles = vec![
+			Style::default(),
+			Style {
+				fg: AnsiColor::Spec(ColorRgb { r: 255, g: 0, b: 0 }),
+				..Style::default()
+			},
+		];
+		for (index, cell) in snapshot.cells.iter_mut().enumerate() {
+			cell.set_style_id(if index < 3 { 0 } else { 1 });
+		}
+		harness.load(&snapshot);
+
+		let painter = harness.run(&Damage::everything(6, 1));
+
+		assert_eq!(painter.runs.len(), 2, "one run per colour");
+		assert_ne!(painter.runs[0].1, painter.runs[1].1);
+		assert_eq!(painter.runs[0].0.start, 0);
+		assert_eq!(painter.runs[1].0.start, 3);
 	}
 }

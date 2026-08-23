@@ -86,6 +86,18 @@ impl Color {
 		}
 	}
 
+	/// The same colour at a fraction of its opacity.
+	///
+	/// Multiplies rather than replaces, so a colour that was already partly
+	/// transparent cannot be made *more* opaque by asking for coverage — the
+	/// shade blocks are the caller, and they mean "this much of the ink",
+	/// not "this much, absolutely".
+	#[inline]
+	pub const fn with_alpha(self, coverage: u8) -> Self {
+		let [r, g, b, a] = self.0;
+		Self([r, g, b, ((a as u16 * coverage as u16) / 255) as u8])
+	}
+
 	/// The conventional two-thirds intensity for SGR 2.
 	#[inline]
 	pub fn dimmed(self) -> Self {
@@ -155,6 +167,54 @@ impl From<Color> for [u8; 4] {
 	}
 }
 
+/// A position on the canvas, in pixels.
+///
+/// A named pair rather than `(f32, f32)`. The tuple was not wrong, it was
+/// unreadable: `frame.origin.0` and `frame.canvas.1` say nothing about which
+/// axis they are, and the two were different *spaces* — one pixels, one whole
+/// canvas extent — spelled identically.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Point {
+	pub x: f32,
+	pub y: f32,
+}
+
+impl Point {
+	pub const ORIGIN: Self = Self { x: 0.0, y: 0.0 };
+
+	#[inline]
+	pub const fn new(x: f32, y: f32) -> Self {
+		Self { x, y }
+	}
+
+	#[inline]
+	pub const fn translate(self, dx: f32, dy: f32) -> Self {
+		Self {
+			x: self.x + dx,
+			y: self.y + dy,
+		}
+	}
+}
+
+/// A canvas extent, in whole pixels.
+///
+/// `u16` because it is what every encoder downstream wants: H.264 codes width
+/// and height as 16-bit values, and a `Pixmap` is constructed from a pair of
+/// them. Carrying the size as `u32` and narrowing at each boundary is three
+/// casts that can each disagree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Size {
+	pub width: u16,
+	pub height: u16,
+}
+
+impl Size {
+	#[inline]
+	pub const fn new(width: u16, height: u16) -> Self {
+		Self { width, height }
+	}
+}
+
 /// One position on the grid.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Cell {
@@ -206,6 +266,32 @@ impl Span {
 	pub const fn is_empty(self) -> bool {
 		self.end <= self.start
 	}
+
+	#[inline]
+	pub const fn contains(self, column: u16) -> bool {
+		column >= self.start && column < self.end
+	}
+
+	/// The same run widened to cover `column`.
+	#[inline]
+	pub const fn including(self, column: u16) -> Self {
+		if self.is_empty() {
+			return Self::new(self.row, column, column + 1);
+		}
+		Self::new(
+			self.row,
+			if column < self.start {
+				column
+			} else {
+				self.start
+			},
+			if column + 1 > self.end {
+				column + 1
+			} else {
+				self.end
+			},
+		)
+	}
 }
 
 /// A rectangle in canvas pixels, as an origin and a size.
@@ -222,6 +308,8 @@ pub struct PixelRect {
 }
 
 impl PixelRect {
+	pub const EMPTY: Self = Self::new(0.0, 0.0, 0.0, 0.0);
+
 	#[inline]
 	pub const fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
 		Self {
@@ -233,8 +321,65 @@ impl PixelRect {
 	}
 
 	#[inline]
+	pub const fn at(origin: Point, width: f32, height: f32) -> Self {
+		Self::new(origin.x, origin.y, width, height)
+	}
+
+	#[inline]
+	pub const fn origin(self) -> Point {
+		Point::new(self.x, self.y)
+	}
+
+	#[inline]
 	pub fn is_empty(self) -> bool {
 		self.width <= 0.0 || self.height <= 0.0
+	}
+
+	/// The horizontal slice `[left, right)` of this rectangle, in units of its
+	/// own width — the unit square mapped onto it.
+	///
+	/// Sprite geometry is written against a unit cell (see [`crate::sprite`]),
+	/// which is the only way a box-drawing corner can be specified once and
+	/// come out sharp at every font size.
+	#[inline]
+	pub fn fraction(self, left: f32, top: f32, right: f32, bottom: f32) -> Self {
+		Self::new(
+			self.x + self.width * left,
+			self.y + self.height * top,
+			self.width * (right - left),
+			self.height * (bottom - top),
+		)
+	}
+
+	/// The same rectangle with every edge rounded to the nearest whole pixel.
+	///
+	/// Box drawing and underlines are the callers. A one-pixel rule landing on
+	/// a half-pixel boundary is anti-aliased across two rows and reads as a
+	/// blurred grey smear rather than a line — the single most visible way a
+	/// rendered TUI looks worse than the terminal it came from.
+	///
+	/// The *edges* are rounded, not the origin and the size independently.
+	/// Rounding a size would let a stroke overshoot the cell it was measured
+	/// against (4.5 wide starting at 4.5 becomes 5 wide starting at 5, one
+	/// pixel past where it should stop); rounding both edges keeps a stroke
+	/// that ended exactly at a cell boundary ending exactly there, which is
+	/// the whole point. Growing to cover instead — flooring the near edge and
+	/// ceiling the far one — is also wrong, and subtly: it turns every
+	/// one-pixel rule that happens to straddle a boundary into a two-pixel
+	/// one, so a light rule and a heavy rule come out the same weight.
+	///
+	/// A rule is never allowed to vanish, so the result is at least one pixel
+	/// in each direction.
+	#[inline]
+	pub fn snapped(self) -> Self {
+		let left = self.x.round();
+		let top = self.y.round();
+		Self::new(
+			left,
+			top,
+			(self.right().round() - left).max(1.0),
+			(self.bottom().round() - top).max(1.0),
+		)
 	}
 
 	#[inline]
@@ -279,13 +424,13 @@ impl PixelRect {
 pub struct Frame {
 	pub metrics: Metrics,
 	/// Canvas position of the top-left corner of cell `(0, 0)`.
-	pub origin: (f32, f32),
+	pub origin: Point,
 	/// Whole canvas, chrome included.
-	pub canvas: (u16, u16),
+	pub canvas: Size,
 }
 
 impl Frame {
-	pub fn new(metrics: Metrics, origin: (f32, f32), canvas: (u16, u16)) -> Self {
+	pub const fn new(metrics: Metrics, origin: Point, canvas: Size) -> Self {
 		Self {
 			metrics,
 			origin,
@@ -296,9 +441,9 @@ impl Frame {
 	/// The canvas rectangle a run of cells occupies.
 	#[inline]
 	pub fn span_rect(&self, span: Span) -> PixelRect {
-		PixelRect::new(
-			self.origin.0 + (span.start as u32 * self.metrics.cell_width) as f32,
-			self.origin.1 + (span.row as u32 * self.metrics.cell_height) as f32,
+		PixelRect::at(
+			self.row_origin(span.row)
+				.translate((span.start as u32 * self.metrics.cell_width) as f32, 0.0),
 			(span.columns() as u32 * self.metrics.cell_width) as f32,
 			self.metrics.cell_height as f32,
 		)
@@ -312,21 +457,33 @@ impl Frame {
 
 	/// Canvas position of a cell's top-left corner.
 	#[inline]
-	pub fn cell_origin(&self, at: Cell) -> (f32, f32) {
-		let rect = self.cell_rect(at);
-		(rect.x, rect.y)
+	pub fn cell_origin(&self, at: Cell) -> Point {
+		self.cell_rect(at).origin()
+	}
+
+	/// Canvas position of a row's top-left corner — the origin every glyph in
+	/// that row is placed relative to.
+	#[inline]
+	pub fn row_origin(&self, row: u16) -> Point {
+		self.origin
+			.translate(0.0, (row as u32 * self.metrics.cell_height) as f32)
 	}
 
 	/// Canvas y of the text baseline for a row.
 	#[inline]
 	pub fn baseline(&self, row: u16) -> f32 {
-		self.origin.1 + (row as u32 * self.metrics.cell_height) as f32 + self.metrics.baseline
+		self.row_origin(row).y + self.metrics.baseline
 	}
 
 	/// The whole canvas.
 	#[inline]
 	pub fn canvas_rect(&self) -> PixelRect {
-		PixelRect::new(0.0, 0.0, self.canvas.0 as f32, self.canvas.1 as f32)
+		PixelRect::new(
+			0.0,
+			0.0,
+			self.canvas.width as f32,
+			self.canvas.height as f32,
+		)
 	}
 }
 
@@ -375,7 +532,7 @@ mod tests {
 	/// Adjacent runs have to tile exactly, or a row of backgrounds grows a seam.
 	#[test]
 	fn adjacent_spans_tile_without_a_gap_or_an_overlap() {
-		let frame = Frame::new(metrics(), (0.0, 0.0), (100, 40));
+		let frame = Frame::new(metrics(), Point::ORIGIN, Size::new(100, 40));
 
 		let left = frame.span_rect(Span::new(0, 0, 3));
 		let right = frame.span_rect(Span::new(0, 3, 8));
@@ -387,17 +544,18 @@ mod tests {
 
 	#[test]
 	fn the_panel_inset_moves_the_whole_grid() {
-		let frame = Frame::new(metrics(), (24.0, 24.0), (148, 88));
+		let frame = Frame::new(metrics(), Point::new(24.0, 24.0), Size::new(148, 88));
 		let rect = frame.cell_rect(Cell::new(2, 1));
 
-		assert_eq!((rect.x, rect.y), (44.0, 44.0));
+		assert_eq!(rect.origin(), Point::new(44.0, 44.0));
 		assert_eq!((rect.width, rect.height), (10.0, 20.0));
 		assert_eq!(frame.baseline(1), 24.0 + 20.0 + 15.0);
+		assert_eq!(frame.row_origin(1), Point::new(24.0, 44.0));
 	}
 
 	#[test]
 	fn a_span_of_one_cell_covers_exactly_that_cell() {
-		let frame = Frame::new(metrics(), (0.0, 0.0), (100, 40));
+		let frame = Frame::new(metrics(), Point::ORIGIN, Size::new(100, 40));
 		assert_eq!(
 			frame.span_rect(Span::cell(Cell::new(4, 1))),
 			frame.cell_rect(Cell::new(4, 1))
@@ -421,5 +579,85 @@ mod tests {
 		let rect = PixelRect::new(0.0, 0.0, 4.0, 4.0).inset(3.0);
 		assert!(rect.is_empty());
 		assert_eq!((rect.width, rect.height), (0.0, 0.0));
+	}
+
+	/// Sprite geometry is written against the unit cell, so the mapping onto a
+	/// real cell has to be exact at both edges — a box-drawing corner whose
+	/// arms stop a fraction short of the boundary leaves a visible seam where
+	/// it should meet its neighbour.
+	#[test]
+	fn a_unit_fraction_maps_onto_the_cell_it_is_taken_from() {
+		let cell = PixelRect::new(10.0, 20.0, 8.0, 16.0);
+
+		let whole = cell.fraction(0.0, 0.0, 1.0, 1.0);
+		assert_eq!(whole, cell);
+
+		let middle_bar = cell.fraction(0.0, 0.5, 1.0, 0.5);
+		assert_eq!(middle_bar.x, 10.0);
+		assert_eq!(middle_bar.y, 28.0);
+		assert_eq!(middle_bar.width, 8.0);
+		assert_eq!(middle_bar.height, 0.0);
+
+		let right_half = cell.fraction(0.5, 0.0, 1.0, 1.0);
+		assert_eq!(right_half.x, 14.0);
+		assert_eq!(right_half.right(), cell.right());
+	}
+
+	/// A hairline that rounds away to nothing is one failure this prevents: a
+	/// sub-pixel rule must survive as one whole pixel.
+	#[test]
+	fn snapping_keeps_a_hairline_as_exactly_one_pixel() {
+		let hairline = PixelRect::new(4.2, 9.8, 10.0, 0.4).snapped();
+
+		assert_eq!(hairline.y, 10.0);
+		assert_eq!(
+			hairline.height, 1.0,
+			"a sub-pixel rule survives as one pixel, not two"
+		);
+		assert_eq!(hairline.x, 4.0);
+		assert_eq!(hairline.right(), 14.0);
+	}
+
+	/// The other failure, and the subtler one: a one-pixel rule sitting on a
+	/// half-pixel boundary must stay one pixel. Growing to cover would make
+	/// it two, which is exactly the weight of a heavy rule — so a light `─`
+	/// and a heavy `━` would come out identical.
+	#[test]
+	fn snapping_does_not_fatten_a_rule_that_straddles_a_boundary() {
+		let straddling = PixelRect::new(0.0, 9.5, 10.0, 1.0).snapped();
+		assert_eq!(straddling.height, 1.0);
+
+		let heavy = PixelRect::new(0.0, 9.0, 10.0, 2.0).snapped();
+		assert_eq!(heavy.height, 2.0, "and a genuinely heavy rule stays heavy");
+	}
+
+	/// A stroke measured to end at a cell boundary must still end there after
+	/// snapping, or every box-drawing arm overshoots into its neighbour.
+	#[test]
+	fn snapping_never_pushes_a_stroke_past_the_edge_it_was_measured_to() {
+		let cell = PixelRect::new(0.0, 0.0, 10.0, 20.0);
+		// A corner's arm runs from just left of centre to the cell's edge.
+		let arm = PixelRect::new(4.5, 0.0, cell.right() - 4.5, 20.0).snapped();
+
+		assert_eq!(
+			arm.right(),
+			cell.right(),
+			"the arm must stop exactly at the cell edge"
+		);
+	}
+
+	/// Damage is widened cell by cell as the cursor moves, so widening has to
+	/// work from an empty run as well as from an existing one.
+	#[test]
+	fn a_span_widens_to_include_a_column_outside_it() {
+		let span = Span::new(3, 4, 6);
+
+		assert_eq!(span.including(1), Span::new(3, 1, 6));
+		assert_eq!(span.including(9), Span::new(3, 4, 10));
+		assert_eq!(span.including(5), span, "an interior column changes nothing");
+		assert_eq!(Span::new(3, 0, 0).including(7), Span::new(3, 7, 8));
+
+		assert!(span.contains(4) && span.contains(5));
+		assert!(!span.contains(6), "a half-open run excludes its end");
 	}
 }
