@@ -10,10 +10,7 @@ pub mod lexer;
 pub mod parser;
 pub mod token;
 
-pub use parser::{
-	Commands, CopyCommand, CtrlCommand, EnvCommand, KeyCommand, OutputCommand, ParseError,
-	RequireCommand, ScreenshotCommand, Setting, SleepCommand, TypeCommand, WaitCommand, WaitMode,
-};
+pub use parser::{Chord, Commands, ParseError, Setting, WaitMode};
 pub use token::TokenType;
 
 use lexer::Lexer;
@@ -36,54 +33,22 @@ mod tests {
 	use super::*;
 	use std::time::Duration;
 
-	fn commands(source: &str) -> Vec<Commands> {
-		let (commands, errors) = parse(source);
+	/// A smoke test of the whole stage — source text through the lexer and
+	/// parser to a command list — where the per-rule detail lives in
+	/// `parser::tests`. A tape exercising several commands at once parses clean.
+	#[test]
+	fn a_representative_tape_parses_end_to_end() {
+		let (commands, errors) =
+			parse("# a greeting\nSet Theme \"nord\"\nType@100ms \"cd \" \"/tmp\"\nHome\nSleep 1s");
 		assert!(errors.is_empty(), "unexpected parse errors: {errors:?}");
-		commands
-	}
-
-	#[test]
-	fn adjacent_string_literals_concatenate() {
-		let parsed = commands(r#"Type "cd " "/tmp""#);
-		let [Commands::Type(typed)] = &parsed[..] else {
-			panic!("expected one Type command, got {parsed:?}");
-		};
-		assert_eq!(typed.text, "cd /tmp");
-	}
-
-	#[test]
-	fn home_is_a_reachable_key() {
-		let parsed = commands("Home");
-		let [Commands::Key(key)] = &parsed[..] else {
-			panic!("expected one Key command, got {parsed:?}");
-		};
-		assert_eq!(key.key, TokenType::Home);
-	}
-
-	/// The parser does not resync after an error, so one bad line cascades into
-	/// several reports. What matters is that it refuses rather than quietly
-	/// exporting a variable named `Set` — not the exact error count.
-	#[test]
-	fn env_rejects_a_keyword_as_a_variable_name() {
-		let (commands, errors) = parse(r#"Env Set "value""#);
-		assert!(!errors.is_empty());
-		assert!(
-			!commands.iter().any(|c| matches!(c, Commands::Env(_))),
-			"no Env command should survive: {commands:?}"
-		);
-	}
-
-	#[test]
-	fn a_rate_prefix_becomes_a_duration() {
-		let parsed = commands(r#"Type@100ms "hi""#);
-		let [Commands::Type(typed)] = &parsed[..] else {
-			panic!("expected one Type command, got {parsed:?}");
-		};
-		assert_eq!(typed.rate, Some(Duration::from_millis(100)));
-	}
-
-	#[test]
-	fn comments_are_skipped_without_error() {
-		assert!(commands("# just a note\nSleep 1s").len() == 1);
+		assert!(matches!(
+			commands.as_slice(),
+			[
+				Commands::Set(Setting::Theme(_)),
+				Commands::Type { rate: Some(rate), text },
+				Commands::Key { key: TokenType::Home, .. },
+				Commands::Sleep { duration: Some(_) },
+			] if *rate == Duration::from_millis(100) && text == "cd /tmp"
+		));
 	}
 }

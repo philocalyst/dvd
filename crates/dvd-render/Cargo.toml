@@ -37,3 +37,5 @@ subsetter.workspace = true
 # back on for `cargo test` only, via dev-dependency feature unification, so the
 # equivalence tests compare two real implementations instead of one twice.
 fearless_simd = { workspace = true, features = ["force_support_fallback"] }
+rstest.workspace = true
+proptest.workspace = true

@@ -10,6 +10,7 @@ pub mod tape;
 
 mod burn;
 mod record;
+mod replay;
 mod theme;
 
 use std::process::ExitCode;
@@ -19,8 +20,13 @@ pub fn run(cli: cli::Cli) -> ExitCode {
 		cli::Commands::Check { files } => check(files),
 		cli::Commands::Burn(args) => burn::burn(args),
 		cli::Commands::Themes { markdown } => themes(*markdown),
-		cli::Commands::Record { shell, output } => record::record(shell, output.clone()),
-		cli::Commands::Play { .. } => Err(anyhow::anyhow!("play is not yet implemented")),
+		cli::Commands::Record {
+			recording,
+			shell,
+			capture_input,
+		} => record::record(shell, recording.clone(), *capture_input),
+		cli::Commands::Play { files } => replay::play(files),
+		cli::Commands::Render { recording, output } => replay::render(recording, output),
 		cli::Commands::New { .. } => Err(anyhow::anyhow!("new is not yet implemented")),
 	};
 

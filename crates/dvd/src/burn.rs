@@ -29,8 +29,8 @@ use regex::Regex;
 use dvd_render::encode::{mp4::Mp4, png::Png, svg::Svg};
 use dvd_render::fonts::Fonts;
 use dvd_render::geom::Color;
-use dvd_render::model::{Palette, Snapshot};
 use dvd_render::grid::GridOptions;
+use dvd_render::model::{Palette, Snapshot};
 use dvd_render::render::{Renderer, Surface};
 use dvd_render::session::{Capture, Session};
 use dvd_render::stream::{Deduplicator, Encoder, Frame, MAXIMUM_QUEUE_DEPTH, Metadata, Sink};
@@ -232,15 +232,12 @@ fn plan(commands: Vec<Commands>) -> Result<Plan> {
 
 	for command in commands {
 		match command {
-			Commands::Set(set) => plan.settings.apply(&set.setting),
-			Commands::Env(env) => plan.environment.push((env.variable, env.value)),
-			Commands::Output(output) => plan.outputs.push((output.path, output.format)),
-			Commands::Require(require) => {
-				if which(&require.program).is_none() {
-					bail!(
-						"this tape requires {:?}, which is not on PATH",
-						require.program
-					);
+			Commands::Set(setting) => plan.settings.apply(&setting),
+			Commands::Env { variable, value } => plan.environment.push((variable, value)),
+			Commands::Output { path, format } => plan.outputs.push((path, format)),
+			Commands::Require { program } => {
+				if which(&program).is_none() {
+					bail!("this tape requires {program:?}, which is not on PATH");
 				}
 			}
 			other => plan.steps.push(other),
@@ -277,7 +274,11 @@ impl Outputs {
 	/// sharing a single context would mean a lock on the hottest path in the
 	/// pipeline.
 	fn fonts(&self) -> Result<Fonts> {
-		Fonts::resolve(self.font_family.as_deref(), self.font_size, self.line_height)
+		Fonts::resolve(
+			self.font_family.as_deref(),
+			self.font_size,
+			self.line_height,
+		)
 	}
 
 	/// Build the sinks for a set of output paths.
@@ -718,24 +719,27 @@ fn run_steps(
 
 	for step in steps {
 		match step {
-			Commands::Type(typed) => {
-				let rate = typed.rate.unwrap_or(settings.typing_speed);
-				type_text(&typed.text, rate, &write)?;
+			Commands::Type { rate, text } => {
+				let rate = rate.unwrap_or(settings.typing_speed);
+				type_text(text, rate, &write)?;
 			}
 
-			Commands::Sleep(sleep) => {
-				std::thread::sleep(sleep.duration.unwrap_or(Duration::from_secs(1)));
+			Commands::Sleep { duration } => {
+				std::thread::sleep(duration.unwrap_or(Duration::from_secs(1)));
 			}
 
-			Commands::Key(key) => {
-				let bytes = key_bytes(&key.key).with_context(|| {
-					format!("{:?} is not a key this recorder can send", key.key)
-				})?;
-				let rate = key.rate.unwrap_or(settings.typing_speed);
+			Commands::Key {
+				rate,
+				key,
+				repeat_count,
+			} => {
+				let bytes = key_bytes(key)
+					.with_context(|| format!("{key:?} is not a key this recorder can send"))?;
+				let rate = rate.unwrap_or(settings.typing_speed);
 
 				// `repeat_count` is zero when the tape wrote a bare key with no
 				// count, which still means press it once.
-				for _ in 0..key.repeat_count.max(1) {
+				for _ in 0..(*repeat_count).max(1) {
 					write(bytes.to_vec())?;
 					std::thread::sleep(rate);
 				}
@@ -758,48 +762,47 @@ fn run_steps(
 				std::thread::sleep(combo.rate.unwrap_or(settings.typing_speed));
 			}
 
-			Commands::Wait(wait) => {
+			Commands::Wait {
+				mode,
+				pattern,
+				timeout,
+			} => {
 				// A bare `Wait` means "the prompt is back" — the semantic
 				// mark answers that directly. `Wait /text/` means something
 				// specific must be on screen, which a fresh prompt does not
 				// establish on its own.
-				let semantic_ok = wait.pattern.is_none();
-				let pattern = match &wait.pattern {
+				let semantic_ok = pattern.is_none();
+				let pattern = match pattern {
 					Some(pattern) => pattern.clone(),
 					None => Regex::new(&settings.wait_pattern)
 						.context("the default Wait pattern is not a valid regex")?,
 				};
-				let timeout = wait.timeout.unwrap_or(settings.wait_timeout);
-				await_screen(
-					stage,
-					session,
-					&pattern,
-					&wait.mode,
-					timeout,
-					semantic_ok,
-					None,
-				)?;
+				let timeout = timeout.unwrap_or(settings.wait_timeout);
+				await_screen(stage, session, &pattern, mode, timeout, semantic_ok, None)?;
 			}
 
-			Commands::Screenshot(shot) => {
+			Commands::Screenshot { path } => {
 				stage
 					.stills
 					.lock()
 					.unwrap_or_else(|error| error.into_inner())
-					.push(shot.path.clone());
+					.push(path.clone());
 				// Give the pump a tick to notice, so the still is of the screen
 				// as it is now rather than of whatever comes next.
 				std::thread::sleep(Duration::from_secs_f64(2.0 / settings.framerate as f64));
 			}
 
-			Commands::Copy(copy) => clipboard = copy.text.clone(),
+			Commands::Copy { text } => clipboard = text.clone(),
 			Commands::Paste => type_text(&clipboard, Duration::ZERO, &write)?,
 
 			Commands::Hide => stage.visible.store(false, Ordering::Release),
 			Commands::Show => stage.visible.store(true, Ordering::Release),
 
 			// Resolved before the session existed; see `plan`.
-			Commands::Set(_) | Commands::Env(_) | Commands::Output(_) | Commands::Require(_) => {}
+			Commands::Set(_)
+			| Commands::Env { .. }
+			| Commands::Output { .. }
+			| Commands::Require { .. } => {}
 		}
 	}
 

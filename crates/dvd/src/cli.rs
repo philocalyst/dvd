@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
-use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
+use strum::VariantNames;
 
 #[derive(Parser)]
 #[command(name = "dvd")]
@@ -23,7 +23,8 @@ pub struct Cli {
 /// selectable as text. The container formats the old list accepted (`mov`,
 /// `mkv`, `webm`, and `gif`) all promised muxers or codecs this pipeline does
 /// not carry, so naming one produced a file that never appeared.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, strum::Display, strum::VariantNames)]
+#[strum(serialize_all = "lowercase")]
 pub enum Output {
 	#[default]
 	Mp4,
@@ -32,24 +33,26 @@ pub enum Output {
 }
 
 impl Output {
-	pub fn from_extension(extension: &str) -> Option<Self> {
-		match extension.to_lowercase().as_str() {
-			"mp4" => Some(Self::Mp4),
-			"png" => Some(Self::Png),
-			"svg" => Some(Self::Svg),
-			_ => None,
-		}
+	/// The lower-cased spellings, in variant order — the single list `Display`
+	/// prints, `FromStr` accepts, and error messages recite.
+	pub fn allowed_extensions() -> &'static [&'static str] {
+		Self::VARIANTS
 	}
 
-	pub fn allowed_extensions() -> &'static [&'static str] {
-		&["mp4", "png", "svg"]
+	pub fn from_extension(extension: &str) -> Option<Self> {
+		let lower = extension.to_lowercase();
+		[Self::Mp4, Self::Png, Self::Svg]
+			.into_iter()
+			.find(|format| format.to_string() == lower)
 	}
 }
 
 /// Parses an extension, not a whole path — `"mp4"`, never `"video.mp4"` or
 /// `".mp4"`. That is what both `clap`'s value parser and the tape's `Output`
-/// command have on hand: a `Path::extension()`, already split from the rest
-/// of the name.
+/// command have on hand: a `Path::extension()`, already split from the name.
+/// Its `Err` names the alternatives, which is what a tape author reading `dvd
+/// check`'s output needs — so this stays hand-written rather than using strum's
+/// `EnumString`, whose "variant not found" carries none of that.
 impl FromStr for Output {
 	type Err = String;
 
@@ -60,17 +63,6 @@ impl FromStr for Output {
 				Self::allowed_extensions().join(", ")
 			)
 		})
-	}
-}
-
-impl fmt::Display for Output {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		let name = match self {
-			Output::Mp4 => "mp4",
-			Output::Png => "png",
-			Output::Svg => "svg",
-		};
-		write!(f, "{name}")
 	}
 }
 
@@ -85,29 +77,30 @@ fn default_shell() -> String {
 
 fn validate_output_path(path_str: &str) -> Result<PathBuf, String> {
 	let path = PathBuf::from(path_str);
-
-	// Get the extension of the provided path
 	let extension = path
 		.extension()
-		.and_then(|ext| ext.to_str())
+		.and_then(|extension| extension.to_str())
 		.ok_or_else(|| {
 			format!(
-				"Output file '{}' must have a valid extension. Allowed extensions: {}",
-				path_str,
+				"Output file '{path_str}' must have a valid extension. Allowed extensions: {}",
 				Output::allowed_extensions().join(", ")
 			)
 		})?;
-
-	// Check that provided path extension against the allowed ones.
-	Output::from_extension(extension).ok_or_else(|| {
-		format!(
-			"Unsupported output format '{}'. Allowed extensions: {}",
-			extension,
-			Output::allowed_extensions().join(", ")
-		)
-	})?;
-
+	extension.parse::<Output>()?;
 	Ok(path)
+}
+
+/// A source recording has one durable journal format.  Keeping this separate
+/// from [`validate_output_path`] makes a mistyped tape or video path fail
+/// before raw mode and the PTY are opened.
+fn validate_recording_path(path_str: &str) -> Result<PathBuf, String> {
+	let path = PathBuf::from(path_str);
+	let extension = path.extension().and_then(|extension| extension.to_str());
+	if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("dvdrec")) {
+		Ok(path)
+	} else {
+		Err(format!("recording source {path_str:?} must end in .dvdrec"))
+	}
 }
 
 #[derive(Subcommand)]
@@ -121,20 +114,33 @@ pub enum Commands {
 
 	Burn(BurnArgs),
 
-	/// Create a new tape file by recording your actions
+	/// Record an interactive terminal session into a durable .dvdrec file
 	Record {
+		/// Session recording to create
+		#[arg(value_parser = validate_recording_path)]
+		recording: PathBuf,
 		/// Shell for recording
 		#[arg(short, long, default_value_t = default_shell())]
 		shell: String,
-		/// Output file (mp4, png, or svg)
-		output: PathBuf,
+		/// Store typed input as well as terminal output
+		#[arg(long)]
+		capture_input: bool,
 	},
 
-	/// Play a tape file
+	/// Replay recording files in the controlling terminal
 	Play {
-		/// Files to play (sequentially)
+		/// Recording files to play sequentially
 		#[arg(required = true)]
 		files: Vec<PathBuf>,
+	},
+
+	/// Render a recording file after it has been captured
+	Render {
+		/// Recording file to render
+		recording: PathBuf,
+		/// Output file (mp4, png, or svg)
+		#[arg(value_parser = validate_output_path)]
+		output: PathBuf,
 	},
 
 	/// Create a new tape file with example tape file contents and documentation
@@ -198,5 +204,49 @@ mod tests {
 		for variant in [Output::Mp4, Output::Png, Output::Svg] {
 			assert_eq!(variant.to_string().parse(), Ok(variant));
 		}
+	}
+
+	#[test]
+	fn record_accepts_a_durable_source_and_capture_input() {
+		let cli = Cli::try_parse_from([
+			"dvd",
+			"record",
+			"session.DVDREC",
+			"--shell",
+			"zsh",
+			"--capture-input",
+		])
+		.unwrap();
+
+		match cli.command {
+			Commands::Record {
+				recording,
+				shell,
+				capture_input,
+			} => {
+				assert_eq!(recording, PathBuf::from("session.DVDREC"));
+				assert_eq!(shell, "zsh");
+				assert!(capture_input);
+			}
+			_ => panic!("record command should parse as Record"),
+		}
+	}
+
+	#[test]
+	fn record_rejects_a_source_without_the_dvdrec_extension() {
+		let error = Cli::try_parse_from(["dvd", "record", "session.mp4"])
+			.err()
+			.expect("a non-recording source should be rejected")
+			.to_string();
+		assert!(error.contains("must end in .dvdrec"));
+	}
+
+	#[test]
+	fn render_requires_a_supported_output_extension() {
+		let error = Cli::try_parse_from(["dvd", "render", "session.dvdrec", "video.gif"])
+			.err()
+			.expect("an unsupported extension should be rejected")
+			.to_string();
+		assert!(error.contains("unsupported output format"));
 	}
 }

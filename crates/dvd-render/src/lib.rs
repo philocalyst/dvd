@@ -62,6 +62,7 @@ pub mod grid;
 pub mod model;
 pub mod outline;
 pub mod paint;
+pub mod recording;
 pub mod render;
 pub mod session;
 pub mod shape;

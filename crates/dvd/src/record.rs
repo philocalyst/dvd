@@ -1,370 +1,230 @@
-//! `dvd record`: inherit the terminal, live-render to a file.
+//! `dvd record`: persist an interactive PTY before displaying its output.
 //!
-//! Asciinema's recording model is the right one: capture the exact byte stream
-//! a PTY produces, paired with timing, so the recording plays back at real
-//! speed. What termwiz adds over `script(1)` is the terminal state: it inherits
-//! the caller's terminal — the actual winsize, the actual `TERM` — so the
-//! recording captures what the user *sees*, not a synthetic sub-shell's
-//! defaults.
-//!
-//! This is live, not deferred. The user types; the PTY runs; the pump captures
-//! at the frame rate; the encoder writes MP4/PNG/SVG in real time. There is no
-//! tape file and no second pass — the recording pipeline is the same
-//! `Session → pump → Encoder` that `dvd burn` uses, just with a live director
-//! (stdin → PTY) instead of a tape-driven one.
+//! The recorder has one durability invariant: every PTY-output chunk reaches
+//! the append-only journal before it reaches the user's terminal.  Rendering
+//! and playback consume that journal later; neither belongs on this path.
 
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
-use dvd_render::fonts::Fonts;
-use dvd_render::model::{Palette, Snapshot};
-use dvd_render::render::{Renderer, Surface};
-use dvd_render::session::{Capture, Session};
-use dvd_render::grid::GridOptions;
-use dvd_render::stream::{Deduplicator, Encoder, Frame, MAXIMUM_QUEUE_DEPTH, Metadata};
-use dvd_render::Level;
+use dvd_render::recording::{Event, Geometry, RecordingHeader, RecordingWriter, TimedEvent};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use termwiz::terminal::Terminal as _;
 
-use crate::cli::Output;
-use crate::theme;
-
-/// Everything `dvd record` needs to resolve before opening the PTY.
-struct RecordConfig {
-	shell: String,
-	outputs: Vec<(PathBuf, Output)>,
-	columns: u16,
-	rows: u16,
-	font_size: f32,
-	theme: String,
-	padding: u32,
-	margin: u32,
-	border_radius: u32,
-	framerate: u32,
-	cursor_blink: bool,
-}
-
-/// `dvd record`: inherit the terminal and live-render to a file.
+/// Run `shell` interactively and save the source stream to `recording`.
 ///
-/// The output path's extension decides the format — `mp4`, `png`, or `svg`,
-/// the same three `dvd burn` supports. The terminal's size is read from the
-/// live terminal via termwiz, so the recording matches what the user sees.
-pub fn record(shell: &str, output: PathBuf) -> Result<()> {
-	let format = output
-		.extension()
-		.and_then(|ext| ext.to_str())
-		.and_then(Output::from_extension)
-		.ok_or_else(|| {
-			anyhow::anyhow!(
-				"output must have one of: {}",
-				Output::allowed_extensions().join(", ")
-			)
-		})?;
+/// Typed input is intentionally omitted unless `capture_input` is set: a
+/// child can disable echo while receiving a password, but its output remains
+/// necessary to replay the session either way.
+pub fn record(shell: &str, recording: PathBuf, capture_input: bool) -> Result<()> {
+	let mut terminal = RawTerminal::open()?;
+	let geometry = terminal.geometry()?;
+	let journal = Arc::new(Mutex::new(Journal::create(
+		&recording,
+		RecordingHeader {
+			geometry,
+			terminal: std::env::var("TERM").ok(),
+			title: None,
+		},
+	)?));
 
-	// Inherit the terminal's size. termwiz reads the current winsize from
-	// `/dev/tty`, so the recording starts at the same dimensions the user's
-	// terminal has right now — not a hard-coded 1200x600.
-	let (columns, rows) = inherit_terminal_size();
+	let pair = native_pty_system()
+		.openpty(pty_size(geometry))
+		.with_context(|| format!("opening a PTY for {shell}"))?;
+	let mut command = CommandBuilder::new(crate::burn::absolute_shell(shell));
+	command.cwd(std::env::current_dir().context("reading the current directory")?);
+	let mut child = pair
+		.slave
+		.spawn_command(command)
+		.with_context(|| format!("starting {shell}"))?;
+	drop(pair.slave);
 
-	// `--shell` defaults to a bare name (see `cli::default_shell`), and the
-	// PTY spawns the program directly rather than through a shell that would
-	// search `PATH` — so it has to become a path now, against *this*
-	// process's own `PATH`. Resolving it later, inside the child, would mean
-	// asking the PATH that macOS's `login(1)` login-shell dance leaves
-	// behind, which is reordered relative to this process's own — the wrong
-	// shell can win if two versions share a name across directories.
-	let config = RecordConfig {
-		shell: crate::burn::absolute_shell(shell),
-		outputs: vec![(output, format)],
-		columns,
-		rows,
-		font_size: 18.0,
-		theme: "dracula".to_string(),
-		padding: 24,
-		margin: 0,
-		border_radius: 12,
-		framerate: 30,
-		cursor_blink: true,
-	};
-
-	run(config)
-}
-
-/// Read the current terminal's grid size (columns × rows) via termwiz.
-///
-/// `COLUMNS`/`LINES` are shell variables, not environment ones — bash and
-/// zsh both keep them local unless a script `export`s them, so reading them
-/// from `std::env` almost never finds anything and this used to silently
-/// fall back to a hard-coded 80×24 on every real invocation. `new_terminal`
-/// opens `/dev/tty` directly and asks the kernel via `TIOCGWINSZ`, which is
-/// what actually reflects the size of the terminal the user is looking at
-/// right now. Falls back to 80×24 only when there is no controlling
-/// terminal to ask (piped output, no tty at all) — the recording still
-/// needs *a* size to open the PTY at.
-fn inherit_terminal_size() -> (u16, u16) {
-	let size = termwiz::caps::Capabilities::new_from_env()
-		.and_then(termwiz::terminal::new_terminal)
-		.and_then(|mut terminal| terminal.get_screen_size());
-
-	match size {
-		Ok(size) => (size.cols as u16, size.rows as u16),
-		Err(_) => (80, 24),
-	}
-}
-
-/// The live recording pipeline. This is the same shape as `burn.rs::record`:
-/// Session → pump → Encoder, just with a live director (stdin → PTY) instead
-/// of a tape-driven one.
-fn run(config: RecordConfig) -> Result<()> {
-	let level = Level::new();
-
-	let theme = theme::resolve(&config.theme)?;
-	let palette = Palette::from_colors(&theme.colors());
-
-	let fonts = Fonts::resolve(None, config.font_size, 1.0)?;
-	let metrics = fonts.metrics;
-	let font_family = fonts.family.clone();
-	let font_size = fonts.size;
-
-	let surface = Surface {
-		margin: config.margin,
-		padding: config.padding,
-		border_radius: config.border_radius,
-		margin_fill: None,
-	};
-
-	let chrome = 2 * (config.margin + config.padding);
-	let columns = config
-		.columns
-		.saturating_sub((chrome / metrics.cell_width) as u16)
-		.max(1);
-	let rows = config
-		.rows
-		.saturating_sub((chrome / metrics.cell_height) as u16)
-		.max(1);
-
-	let options = GridOptions::default();
-	let renderer = Renderer::new(
-		fonts,
-		palette.clone(),
-		options,
-		surface,
-		columns,
-		rows,
-		level,
-	)?;
-	let canvas = renderer.size();
-
-	// The same builder `burn` uses. This was a second copy of the `match`,
-	// which meant every change to a sink's constructor had to be made twice.
-	let sinks = crate::burn::Outputs {
-		font_family: Some(font_family),
-		font_size,
-		line_height: 1.0,
-		palette: palette.clone(),
-		options,
-		surface,
-		columns,
-		rows,
-		level,
-	}
-	.sinks(&config.outputs)?;
-
-	// Open the session: a real PTY with a real shell, sized to the inherited
-	// terminal.
-	let session = Session::open(
-		&config.shell,
-		Vec::new(),
-		std::env::current_dir()
-			.ok()
-			.and_then(|path| path.to_str().map(str::to_string)),
-		columns,
-		rows,
-		(metrics.cell_width, metrics.cell_height),
-		&[],
+	let reader = pair
+		.master
+		.try_clone_reader()
+		.context("cloning the PTY reader")?;
+	let writer = Arc::new(Mutex::new(
+		pair.master
+			.take_writer()
+			.context("opening the PTY writer")?,
+	));
+	let stopped = Arc::new(AtomicBool::new(false));
+	forward_input(
+		writer,
+		Arc::clone(&journal),
+		Arc::clone(&stopped),
+		capture_input,
 	)?;
 
-	if !config.cursor_blink {
-		session.write(&b"\x1b[?12l"[..])?;
+	let output = copy_output(reader, Arc::clone(&journal));
+	stopped.store(true, Ordering::Release);
+	if output.is_err() {
+		let _ = child.kill();
 	}
-
-	let played = config.framerate.clamp(1, u8::MAX as u32) as u8;
-	let meta = Metadata {
-		width: canvas.width,
-		height: canvas.height,
-		frames_per_second: played,
-	};
-
-	let (sender, receiver) = std::sync::mpsc::sync_channel::<Frame>(MAXIMUM_QUEUE_DEPTH);
-	let encoder = Encoder::new(Box::new(renderer), sinks);
-	let encoding = std::thread::Builder::new()
-		.name("dvd-encode".to_string())
-		.spawn(move || encoder.run(receiver, meta))
-		.context("starting the encoder thread")?;
-
-	let session = Arc::new(Mutex::new(session));
-	let stage = Arc::new(Stage {
-		visible: AtomicBool::new(true),
-		finished: AtomicBool::new(false),
-		stills: Mutex::new(Vec::new()),
-	});
-
-	// The live director: read user input from stdin and write it to the PTY.
-	// This replaces the tape-driven `direct` in burn.rs with a simple stdin
-	// pump. The director exits when the shell exits (Ctrl-D / `exit`) or
-	// stdin reaches EOF.
-	let director = {
-		let session = Arc::clone(&session);
-		let stage = Arc::clone(&stage);
-		std::thread::Builder::new()
-			.name("dvd-direct".to_string())
-			.spawn(move || live_director(&session, &stage))
-			.context("starting the director thread")?
-	};
-
-	let pump_result = pump(&session, &stage, &config, columns, rows, level, sender);
-
-	let directed = director
-		.join()
-		.map_err(|_| anyhow::anyhow!("the director thread panicked"))?;
-	directed?;
-	pump_result?;
-
-	encoding
-		.join()
-		.map_err(|_| anyhow::anyhow!("the encoder thread panicked"))?
-		.context("encoding")?;
-
-	for (path, _) in &config.outputs {
-		println!("wrote {}", path.display());
+	let status = child.wait().context("waiting for the shell")?;
+	if output.is_ok() {
+		journal
+			.lock()
+			.unwrap_or_else(|error| error.into_inner())
+			.append(Event::Exit(i32::try_from(status.exit_code()).ok()))?;
 	}
-
-	Ok(())
+	journal
+		.lock()
+		.unwrap_or_else(|error| error.into_inner())
+		.finish()?;
+	drop(terminal);
+	output
 }
 
-/// What the two threads say to each other. Same shape as burn.rs's `Stage`.
-struct Stage {
-	visible: AtomicBool,
-	finished: AtomicBool,
-	stills: Mutex<Vec<PathBuf>>,
+/// termwiz owns the saved terminal mode and restores it when this guard falls
+/// out of scope; the explicit call keeps the ordinary return path obvious.
+struct RawTerminal {
+	inner: termwiz::terminal::SystemTerminal,
 }
 
-/// The live director: read stdin, write to the PTY, until the shell exits.
-///
-/// Unlike the tape-driven director in `burn.rs`, this one has no steps to
-/// run — it just forwards bytes from stdin to the session. The user *is* the
-/// tape. The director exits when stdin reaches EOF (Ctrl-D) or the session
-/// reports the child has exited.
-fn live_director(session: &Mutex<Session>, stage: &Stage) -> Result<()> {
-	let mut stdin = std::io::stdin();
-	let mut buf = [0u8; 4096];
-
-	loop {
-		// Check if the child process has exited.
-		{
-			let session = session.lock().unwrap_or_else(|e| e.into_inner());
-			if session.exited() {
-				break;
-			}
-		}
-
-		// Read user input. This blocks until the user types something or
-		// hits Ctrl-D, which is what we want — the director does nothing
-		// while the user is idle, and the pump keeps capturing at the frame
-		// rate regardless.
-		match stdin.read(&mut buf) {
-			Ok(0) => {
-				// stdin closed (Ctrl-D / EOF). Tell the shell to exit.
-				let session = session.lock().unwrap_or_else(|e| e.into_inner());
-				let _ = session.write(&b"\x04"[..]); // Ctrl-D
-				break;
-			}
-			Ok(n) => {
-				let session = session.lock().unwrap_or_else(|e| e.into_inner());
-				session.write(buf[..n].to_vec())?;
-			}
-			Err(_) => break,
-		}
+impl RawTerminal {
+	fn open() -> Result<Self> {
+		let capabilities =
+			termwiz::caps::Capabilities::new_from_env().context("reading terminal capabilities")?;
+		let mut inner = termwiz::terminal::SystemTerminal::new(capabilities)
+			.context("opening the controlling terminal")?;
+		inner.set_raw_mode().context("enabling raw terminal mode")?;
+		Ok(Self { inner })
 	}
 
-	stage.finished.store(true, Ordering::Release);
-	Ok(())
+	fn geometry(&mut self) -> Result<Geometry> {
+		let size = self
+			.inner
+			.get_screen_size()
+			.context("reading terminal size")?;
+		Ok(Geometry {
+			columns: u16::try_from(if size.cols == 0 { 80 } else { size.cols })
+				.context("terminal has too many columns")?,
+			rows: u16::try_from(if size.rows == 0 { 24 } else { size.rows })
+				.context("terminal has too many rows")?,
+			pixel_width: u32::try_from(size.xpixel).unwrap_or(u32::MAX),
+			pixel_height: u32::try_from(size.ypixel).unwrap_or(u32::MAX),
+		})
+	}
 }
 
-/// The capture clock — identical to burn.rs's `pump`, just reading the
-/// config from `RecordConfig` instead of `Settings`.
-fn pump(
-	session: &Mutex<Session>,
-	stage: &Stage,
-	config: &RecordConfig,
-	columns: u16,
-	rows: u16,
-	level: Level,
-	sender: std::sync::mpsc::SyncSender<Frame>,
+impl Drop for RawTerminal {
+	fn drop(&mut self) {
+		let _ = self.inner.set_cooked_mode();
+	}
+}
+
+struct Journal {
+	writer: RecordingWriter,
+	started: Instant,
+}
+
+impl Journal {
+	fn create(path: &PathBuf, header: RecordingHeader) -> Result<Self> {
+		Ok(Self {
+			writer: RecordingWriter::create(path, header)
+				.with_context(|| format!("creating recording {}", path.display()))?,
+			started: Instant::now(),
+		})
+	}
+
+	fn append(&mut self, event: Event) -> Result<()> {
+		let timestamp_ns = self
+			.started
+			.elapsed()
+			.as_nanos()
+			.try_into()
+			.unwrap_or(u64::MAX);
+		self.writer
+			.append(TimedEvent {
+				timestamp_ns,
+				event,
+			})
+			.context("appending recording event")
+	}
+
+	fn finish(&mut self) -> Result<()> {
+		self.writer.finish().context("finalising recording")
+	}
+}
+
+fn forward_input(
+	writer: Arc<Mutex<Box<dyn Write + Send>>>,
+	journal: Arc<Mutex<Journal>>,
+	stopped: Arc<AtomicBool>,
+	capture_input: bool,
 ) -> Result<()> {
-	let interval = Duration::from_secs_f64(1.0 / config.framerate as f64);
-	let mut dedup = Deduplicator::new(level);
-	let mut scratch = Snapshot::new(columns, rows);
-
-	let mut pending: Option<Frame> = None;
-	let mut next_tick = Instant::now();
-	let mut trailing: Option<Instant> = None;
-
-	// The trailing-capture grace after the shell exits, so the last command's
-	// output is actually in the recording.
-	const TRAILING_CAPTURE: Duration = Duration::from_millis(750);
-
-	loop {
-		next_tick += interval;
-		let now = Instant::now();
-		if next_tick > now {
-			std::thread::sleep(next_tick - now);
-		} else {
-			next_tick = now;
-		}
-
-		let captured = {
-			let mut session = session.lock().unwrap_or_else(|error| error.into_inner());
-			session.capture(&mut scratch)
-		};
-
-		let visible = stage.visible.load(Ordering::Acquire);
-		let fresh = visible && captured == Capture::Changed && dedup.admit(&scratch);
-
-		if fresh {
-			let mut snapshot = Snapshot::new(columns, rows);
-			snapshot.columns = scratch.columns;
-			snapshot.screen_rows = scratch.screen_rows;
-			snapshot.cells.clone_from(&scratch.cells);
-			snapshot.styles.clone_from(&scratch.styles);
-			snapshot.extras.clone_from(&scratch.extras);
-			snapshot.graphics.clone_from(&scratch.graphics);
-			snapshot.cursor = scratch.cursor.clone();
-			snapshot.cursor_visible = scratch.cursor_visible;
-
-			if let Some(previous) = pending.take() {
-				let _ = sender.send(previous);
+	thread::Builder::new()
+		.name("dvd-record-input".to_string())
+		.spawn(move || {
+			let mut input = match OpenOptions::new().read(true).open("/dev/tty") {
+				Ok(input) => input,
+				Err(_) => return,
+			};
+			let mut bytes = [0; 8192];
+			while !stopped.load(Ordering::Acquire) {
+				let count = match input.read(&mut bytes) {
+					Ok(count) => count,
+					Err(_) => return,
+				};
+				if count == 0 || stopped.load(Ordering::Acquire) {
+					return;
+				}
+				if writer
+					.lock()
+					.unwrap_or_else(|error| error.into_inner())
+					.write_all(&bytes[..count])
+					.is_err()
+				{
+					return;
+				}
+				if capture_input
+					&& journal
+						.lock()
+						.unwrap_or_else(|error| error.into_inner())
+						.append(Event::Input(bytes[..count].to_vec()))
+						.is_err()
+				{
+					return;
+				}
 			}
-
-			pending = Some(Frame::new(Arc::new(snapshot), 1));
-		} else if let Some(frame) = pending.as_mut() {
-			frame.hold_ticks += 1;
-		}
-
-		if stage.finished.load(Ordering::Acquire) {
-			let deadline = *trailing.get_or_insert_with(|| Instant::now() + TRAILING_CAPTURE);
-			if Instant::now() >= deadline {
-				break;
-			}
-		}
-	}
-
-	if let Some(frame) = pending.take() {
-		let _ = sender.send(frame);
-	}
-
+		})
+		.context("starting the terminal input reader")?;
 	Ok(())
+}
+
+fn copy_output(mut reader: Box<dyn Read + Send>, journal: Arc<Mutex<Journal>>) -> Result<()> {
+	let mut terminal = OpenOptions::new()
+		.write(true)
+		.open("/dev/tty")
+		.context("opening the controlling terminal for output")?;
+	let mut bytes = [0; 8192];
+	loop {
+		let count = reader.read(&mut bytes).context("reading PTY output")?;
+		if count == 0 {
+			return terminal.flush().context("flushing terminal output");
+		}
+		journal
+			.lock()
+			.unwrap_or_else(|error| error.into_inner())
+			.append(Event::Output(bytes[..count].to_vec()))?;
+		terminal
+			.write_all(&bytes[..count])
+			.context("writing PTY output to the terminal")?;
+	}
+}
+
+fn pty_size(geometry: Geometry) -> PtySize {
+	PtySize {
+		rows: geometry.rows,
+		cols: geometry.columns,
+		pixel_width: u16::try_from(geometry.pixel_width).unwrap_or(u16::MAX),
+		pixel_height: u16::try_from(geometry.pixel_height).unwrap_or(u16::MAX),
+	}
 }

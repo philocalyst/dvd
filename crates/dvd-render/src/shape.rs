@@ -459,6 +459,7 @@ mod tests {
 	use rio_vt::config::colors::{AnsiColor, ColorRgb};
 	use rio_vt::crosswords::square::Square;
 	use rio_vt::crosswords::style::Style;
+	use rstest::rstest;
 
 	fn shaper() -> Shaper {
 		Shaper::new(Fonts::resolve(Some("Liberation Mono"), 16.0, 1.0).unwrap())
@@ -475,16 +476,9 @@ mod tests {
 		grid
 	}
 
-	/// Two rows that differ only in colour must share a cache entry. The hit
-	/// is the whole point of keying on content rather than on appearance.
-	#[test]
-	fn a_row_that_changed_only_in_colour_hits_the_cache() {
-		let palette = Palette::default();
-		let mut shaper = shaper();
-
-		let mut plain = Snapshot::new(4, 1);
-		plain.cells.fill(Square::from_char('a'));
-
+	/// "aaaa" painted red: same characters as `grid_of("aaaa", 4)`, differing
+	/// only in appearance.
+	fn coloured_row() -> Grid {
 		let mut coloured = Snapshot::new(4, 1);
 		coloured.cells.fill(Square::from_char('a'));
 		coloured.styles = vec![Style {
@@ -494,30 +488,42 @@ mod tests {
 		for cell in &mut coloured.cells {
 			cell.set_style_id(0);
 		}
+		let mut grid = Grid::new(4, 1);
+		grid.fill(&coloured, &Palette::default(), &GridOptions::default());
+		grid
+	}
 
-		let mut first = Grid::new(4, 1);
-		first.fill(&plain, &palette, &GridOptions::default());
-		let mut second = Grid::new(4, 1);
-		second.fill(&coloured, &palette, &GridOptions::default());
+	/// The cache keys on content, not appearance. A re-shape shares the key
+	/// and the entry only when the characters match; any changed character
+	/// forces a fresh key and a new entry.
+	#[rstest]
+	// Two rows that differ only in colour must share a cache entry. The hit
+	// is the whole point of keying on content rather than on appearance.
+	#[case(grid_of("aaaa", 4), coloured_row(), true, 0)]
+	// A single changed character must miss and add its own entry.
+	#[case(grid_of("aaaa", 4), grid_of("abaa", 4), false, 1)]
+	fn re_shaping_hits_the_cache_only_when_the_characters_match(
+		#[case] first: Grid,
+		#[case] second: Grid,
+		#[case] shares_key: bool,
+		#[case] cache_delta: usize,
+	) {
+		let mut shaper = shaper();
 
 		let key = shaper.ensure_row(&first, 0);
 		let cached = shaper.cached_rows();
 		let same = shaper.ensure_row(&second, 0);
 
-		assert_eq!(key, same, "rows differing only in colour share a key");
-		assert_eq!(shaper.cached_rows(), cached, "and share the entry");
-	}
-
-	#[test]
-	fn a_row_whose_character_changed_misses_the_cache() {
-		let mut shaper = shaper();
-
-		let before = shaper.ensure_row(&grid_of("aaaa", 4), 0);
-		let cached = shaper.cached_rows();
-		let after = shaper.ensure_row(&grid_of("abaa", 4), 0);
-
-		assert_ne!(before, after);
-		assert_eq!(shaper.cached_rows(), cached + 1);
+		assert_eq!(
+			key == same,
+			shares_key,
+			"key sharing must follow the characters"
+		);
+		assert_eq!(
+			shaper.cached_rows(),
+			cached + cache_delta,
+			"entry count must follow the characters"
+		);
 	}
 
 	/// A layout has to stay readable while the faces map is also borrowed —

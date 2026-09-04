@@ -13,6 +13,7 @@ rayon = "1"
 rustc-hash = "2.1"
 crossbeam = "0.8"
 subsetter = "0.2"
+portable-pty = "0.9"
 
 # The terminal core. Everything about VT state, the grid, and the PTY comes
 # from here; `dvd` owns no escape-sequence logic of its own.
@@ -62,3 +63,6 @@ flate2 = "1"
 
 clap = { version = "4.5", features = ["derive"] }
 regex = "1"
+strum = { version = "0.27", features = ["derive"] }
+rstest = "0.24"
+proptest = "1"

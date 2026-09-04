@@ -14,5 +14,10 @@ anyhow.workspace = true
 clap.workspace = true
 regex.workspace = true
 termwiz.workspace = true
+strum.workspace = true
+portable-pty.workspace = true
 
 dvd-render = { path = "../dvd-render" }
+
+[dev-dependencies]
+rstest.workspace = true

@@ -490,6 +490,8 @@ impl Frame {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use proptest::prelude::*;
+	use rstest::rstest;
 
 	fn metrics() -> Metrics {
 		Metrics {
@@ -503,30 +505,41 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn a_colour_spells_itself_the_way_svg_wants() {
-		assert_eq!(Color::rgb(0x28, 0x2a, 0x36).to_string(), "#282a36");
-		assert_eq!(Color::rgb(0, 0, 0).to_string(), "#000000");
-		assert_eq!(Color::WHITE.to_string(), "#ffffff");
+	#[rstest]
+	#[case(Color::rgb(0x28, 0x2a, 0x36), "#282a36")]
+	#[case(Color::rgb(0, 0, 0), "#000000")]
+	#[case(Color::WHITE, "#ffffff")]
+	fn a_colour_spells_itself_the_way_svg_wants(#[case] colour: Color, #[case] spelt: &str) {
+		assert_eq!(colour.to_string(), spelt);
 	}
 
 	/// The VT core's alpha is a GPU blend weight, not opacity. Carrying it
 	/// through would make ordinary text translucent.
-	#[test]
-	fn converting_from_the_vt_table_forces_opacity() {
-		assert_eq!(Color::from_vt([1.0, 0.0, 0.0, 0.0]), Color::rgb(255, 0, 0));
-		assert_eq!(
-			Color::from_vt([2.0, -1.0, 0.5, 1.0]),
-			Color::rgb(255, 0, 128)
-		);
+	#[rstest]
+	#[case([1.0, 0.0, 0.0, 0.0], Color::rgb(255, 0, 0))]
+	// Out-of-range channels clamp into 0..=1 before scaling to bytes.
+	#[case([2.0, -1.0, 0.5, 1.0], Color::rgb(255, 0, 128))]
+	fn converting_from_the_vt_table_forces_opacity(#[case] vt: [f32; 4], #[case] expected: Color) {
+		assert_eq!(Color::from_vt(vt), expected);
 	}
 
-	#[test]
-	fn ink_is_chosen_to_stay_readable() {
-		assert_eq!(Color::WHITE.contrasting(), Color::BLACK);
-		assert_eq!(Color::BLACK.contrasting(), Color::WHITE);
-		// Mid-grey is the case a plain inversion gets wrong.
-		assert_eq!(Color::rgb(128, 128, 128).contrasting(), Color::WHITE);
+	#[rstest]
+	#[case(Color::WHITE, Color::BLACK)]
+	#[case(Color::BLACK, Color::WHITE)]
+	// Mid-grey is the case a plain inversion gets wrong.
+	#[case(Color::rgb(128, 128, 128), Color::WHITE)]
+	fn ink_is_chosen_to_stay_readable(#[case] background: Color, #[case] ink: Color) {
+		assert_eq!(background.contrasting(), ink);
+	}
+
+	proptest! {
+		/// `Color` is exactly the four bytes it wraps; the `From` conversions in
+		/// each direction, and `channels`, must all agree and round-trip.
+		#[test]
+		fn a_colour_round_trips_through_its_channels(channels: [u8; 4]) {
+			prop_assert_eq!(Color::from(channels).channels(), channels);
+			prop_assert_eq!(<[u8; 4]>::from(Color(channels)), channels);
+		}
 	}
 
 	/// Adjacent runs have to tile exactly, or a row of backgrounds grows a seam.
@@ -571,6 +584,30 @@ mod tests {
 
 		let c = PixelRect::new(5.0, 5.0, 10.0, 10.0);
 		assert_eq!(a.intersect(c), Some(PixelRect::new(5.0, 5.0, 5.0, 5.0)));
+	}
+
+	proptest! {
+		/// The overlap is order-independent and never escapes either input: it
+		/// sits inside both rectangles it was cut from.
+		#[test]
+		fn an_intersection_is_symmetric_and_contained(
+			ax in 0.0f32..200.0, ay in 0.0f32..200.0,
+			aw in 0.0f32..200.0, ah in 0.0f32..200.0,
+			bx in 0.0f32..200.0, by in 0.0f32..200.0,
+			bw in 0.0f32..200.0, bh in 0.0f32..200.0,
+		) {
+			let a = PixelRect::new(ax, ay, aw, ah);
+			let b = PixelRect::new(bx, by, bw, bh);
+
+			prop_assert_eq!(a.intersect(b), b.intersect(a));
+
+			if let Some(overlap) = a.intersect(b) {
+				prop_assert!(overlap.x >= a.x && overlap.x >= b.x);
+				prop_assert!(overlap.y >= a.y && overlap.y >= b.y);
+				prop_assert!(overlap.right() <= a.right().min(b.right()) + 1e-3);
+				prop_assert!(overlap.bottom() <= a.bottom().min(b.bottom()) + 1e-3);
+			}
+		}
 	}
 
 	/// Clipping a placement against the panel must not produce a negative size.
@@ -648,16 +685,45 @@ mod tests {
 
 	/// Damage is widened cell by cell as the cursor moves, so widening has to
 	/// work from an empty run as well as from an existing one.
+	#[rstest]
+	#[case(Span::new(3, 4, 6), 1, Span::new(3, 1, 6))] // a column left of the run extends the start
+	#[case(Span::new(3, 4, 6), 9, Span::new(3, 4, 10))] // a column right of the run extends the end
+	#[case(Span::new(3, 4, 6), 5, Span::new(3, 4, 6))] // an interior column changes nothing
+	#[case(Span::new(3, 0, 0), 7, Span::new(3, 7, 8))] // an empty run seeds a single cell
+	fn a_span_widens_to_include_a_column_outside_it(
+		#[case] span: Span,
+		#[case] column: u16,
+		#[case] widened: Span,
+	) {
+		assert_eq!(span.including(column), widened);
+	}
+
 	#[test]
-	fn a_span_widens_to_include_a_column_outside_it() {
+	fn a_half_open_run_contains_its_interior_but_not_its_end() {
 		let span = Span::new(3, 4, 6);
-
-		assert_eq!(span.including(1), Span::new(3, 1, 6));
-		assert_eq!(span.including(9), Span::new(3, 4, 10));
-		assert_eq!(span.including(5), span, "an interior column changes nothing");
-		assert_eq!(Span::new(3, 0, 0).including(7), Span::new(3, 7, 8));
-
 		assert!(span.contains(4) && span.contains(5));
 		assert!(!span.contains(6), "a half-open run excludes its end");
+	}
+
+	proptest! {
+		/// Widening always makes the run contain the new column, and never
+		/// drops a column the run already covered — the property the hand-picked
+		/// left/right/interior/empty cases above each sample one point of.
+		#[test]
+		fn including_a_column_covers_it_and_keeps_the_rest(
+			row: u16,
+			start in 0u16..1000,
+			len in 0u16..64,
+			column in 0u16..1000,
+		) {
+			let end = start + len;
+			let span = Span::new(row, start, end);
+			let widened = span.including(column);
+
+			prop_assert!(widened.contains(column));
+			for covered in start..end {
+				prop_assert!(widened.contains(covered));
+			}
+		}
 	}
 }
