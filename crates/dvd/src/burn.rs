@@ -33,7 +33,9 @@ use dvd_render::grid::GridOptions;
 use dvd_render::model::{Palette, Snapshot};
 use dvd_render::render::{Renderer, Surface};
 use dvd_render::session::{Capture, Session};
-use dvd_render::stream::{Deduplicator, Encoder, Frame, MAXIMUM_QUEUE_DEPTH, Metadata, Sink};
+use dvd_render::stream::{
+	Deduplicator, Encoder, EncoderMessage, Frame, MAXIMUM_QUEUE_DEPTH, Metadata, Sink,
+};
 use dvd_render::{Level, rio_vt};
 
 use crate::cli::{BurnArgs, Output};
@@ -481,7 +483,7 @@ fn record(plan: Plan) -> Result<()> {
 		frames_per_second: played,
 	};
 
-	let (sender, receiver) = std::sync::mpsc::sync_channel::<Frame>(MAXIMUM_QUEUE_DEPTH);
+	let (sender, receiver) = std::sync::mpsc::sync_channel::<EncoderMessage>(MAXIMUM_QUEUE_DEPTH);
 	let encoder = Encoder::new(Box::new(renderer), sinks);
 	let encoding = std::thread::Builder::new()
 		.name("dvd-encode".to_string())
@@ -538,7 +540,7 @@ struct Stage {
 	visible: AtomicBool,
 	/// The director has run the last command.
 	finished: AtomicBool,
-	/// Stills requested since the last frame was emitted.
+	/// Screenshots requested since the last frame was emitted.
 	stills: Mutex<Vec<PathBuf>>,
 	/// The most recent picture, as text, for `Wait` to match against.
 	screen: Mutex<Screen>,
@@ -607,7 +609,7 @@ fn pump(
 	columns: u16,
 	rows: u16,
 	level: Level,
-	sender: std::sync::mpsc::SyncSender<Frame>,
+	sender: std::sync::mpsc::SyncSender<EncoderMessage>,
 ) -> Result<()> {
 	let interval = Duration::from_secs_f64(1.0 / settings.framerate as f64);
 	let mut dedup = Deduplicator::new(level);
@@ -661,14 +663,18 @@ fn pump(
 			// The frame that was on screen is now finished: its hold is however
 			// many ticks it survived, and it can go.
 			if let Some(previous) = pending.take() {
-				let _ = sender.send(previous);
+				let _ = sender.send(EncoderMessage::Frame(previous));
 			}
 
-			let mut frame = Frame::new(Arc::new(snapshot), 1);
-			frame.stills = stills;
-			pending = Some(frame);
+			for path in stills {
+				let _ = sender.send(EncoderMessage::AddSink {
+					sink: Box::new(Png::new(path)),
+					one_shot: true,
+				});
+			}
+			pending = Some(Frame::new(Arc::new(snapshot), 1));
 		} else if let Some(frame) = pending.as_mut() {
-			frame.hold_ticks += 1;
+			frame.hold_ticks = frame.hold_ticks.saturating_add(1);
 		}
 
 		if stage.finished.load(Ordering::Acquire) {
@@ -682,7 +688,7 @@ fn pump(
 	}
 
 	if let Some(frame) = pending.take() {
-		let _ = sender.send(frame);
+		let _ = sender.send(EncoderMessage::Frame(frame));
 	}
 
 	Ok(())

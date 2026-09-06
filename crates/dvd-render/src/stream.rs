@@ -95,18 +95,27 @@ impl<Type: std::fmt::Debug> std::fmt::Debug for Pooled<Type> {
 /// One distinct picture, and how long it stays on screen.
 pub struct Frame {
 	pub snapshot: Arc<Snapshot>,
-	pub hold_ticks: u32,
-	pub stills: Vec<std::path::PathBuf>,
+	pub hold_ticks: u64,
 }
 
 impl Frame {
-	pub fn new(snapshot: Arc<Snapshot>, hold_ticks: u32) -> Self {
+	pub fn new(snapshot: Arc<Snapshot>, hold_ticks: u64) -> Self {
 		Self {
 			snapshot,
 			hold_ticks,
-			stills: Vec::new(),
 		}
 	}
+}
+
+/// A message from the single capture producer to the encoder.
+///
+/// Dynamic sinks are installed in-band with frames. This makes a screenshot
+/// observe exactly the frame the tape requested: the producer sends the sink
+/// immediately before the forced frame, and the encoder processes both in
+/// order on one queue.
+pub enum EncoderMessage {
+	Frame(Frame),
+	AddSink { sink: Box<dyn Sink>, one_shot: bool },
 }
 
 /// What a sink is handed for each frame.
@@ -219,10 +228,15 @@ impl Deduplicator {
 
 pub struct Encoder {
 	rasterizer: Box<dyn Rasterizer>,
-	sinks: Vec<Box<dyn Sink>>,
+	sinks: Vec<ActiveSink>,
 	surfaces: Arc<Pool<Pixmap>>,
 	requires_pixels: bool,
 	pub stalled_frames: usize,
+}
+
+struct ActiveSink {
+	sink: Box<dyn Sink>,
+	one_shot: bool,
 }
 
 impl Encoder {
@@ -232,7 +246,13 @@ impl Encoder {
 
 		Self {
 			rasterizer,
-			sinks,
+			sinks: sinks
+				.into_iter()
+				.map(|sink| ActiveSink {
+					sink,
+					one_shot: false,
+				})
+				.collect(),
 			surfaces: Pool::new(move || Pixmap::new(width, height)),
 			requires_pixels,
 			stalled_frames: 0,
@@ -242,51 +262,61 @@ impl Encoder {
 	/// Consume frames until the sender hangs up, then close every sink.
 	pub fn run(
 		mut self,
-		frames: std::sync::mpsc::Receiver<Frame>,
+		messages: std::sync::mpsc::Receiver<EncoderMessage>,
 		metadata: Metadata,
 	) -> Result<()> {
 		self.initialize_sinks(&metadata)?;
 
-		for frame in frames {
-			self.process_frame(&frame)?;
+		for message in messages {
+			match message {
+				EncoderMessage::Frame(frame) => self.process_frame(&frame)?,
+				EncoderMessage::AddSink { sink, one_shot } => {
+					self.add_sink(sink, one_shot, &metadata)?;
+				}
+			}
 		}
 
 		self.finalize_sinks()
 	}
 
 	fn initialize_sinks(&mut self, metadata: &Metadata) -> Result<()> {
-		for sink in &mut self.sinks {
-			sink.begin(metadata)?;
+		for active in &mut self.sinks {
+			active.sink.begin(metadata)?;
 		}
+		Ok(())
+	}
+
+	fn add_sink(
+		&mut self,
+		mut sink: Box<dyn Sink>,
+		one_shot: bool,
+		metadata: &Metadata,
+	) -> Result<()> {
+		let requires_pixels = sink.requires_pixels();
+		sink.begin(metadata)?;
+		self.requires_pixels |= requires_pixels;
+		self.sinks.push(ActiveSink { sink, one_shot });
 		Ok(())
 	}
 
 	fn process_frame(&mut self, frame: &Frame) -> Result<()> {
-		let needs_surface = self.requires_pixels || !frame.stills.is_empty();
+		let needs_surface = self.requires_pixels;
 		let mut surface_loan = needs_surface.then(|| self.surfaces.take());
 
 		if let Some(surface) = surface_loan.as_mut() {
-			self.render_and_save_stills(frame, surface)?;
+			self.rasterizer.render(&frame.snapshot, surface);
 		}
 
-		self.dispatch_to_sinks(frame, surface_loan.as_deref())
-	}
-
-	fn render_and_save_stills(&mut self, frame: &Frame, surface: &mut Pixmap) -> Result<()> {
-		self.rasterizer.render(&frame.snapshot, surface);
-
-		for still_path in &frame.stills {
-			crate::encode::png::write(still_path, surface)?;
-		}
-		Ok(())
+		self.dispatch_to_sinks(frame, surface_loan.as_deref())?;
+		self.retire_one_shot_sinks()
 	}
 
 	fn dispatch_to_sinks(&mut self, frame: &Frame, pixels: Option<&Pixmap>) -> Result<()> {
-		for sink in &mut self.sinks {
+		for active in &mut self.sinks {
 			// Elegant one-liner: only pass pixels if the sink specifically asks for them
-			let sink_pixels = sink.requires_pixels().then_some(pixels).flatten();
+			let sink_pixels = active.sink.requires_pixels().then_some(pixels).flatten();
 
-			sink.accept(Context {
+			active.sink.accept(Context {
 				frame,
 				pixels: sink_pixels,
 			})?;
@@ -294,9 +324,23 @@ impl Encoder {
 		Ok(())
 	}
 
+	fn retire_one_shot_sinks(&mut self) -> Result<()> {
+		let mut active = Vec::with_capacity(self.sinks.len());
+		for sink in self.sinks.drain(..) {
+			if sink.one_shot {
+				sink.sink.finish()?;
+			} else {
+				active.push(sink);
+			}
+		}
+		self.sinks = active;
+		self.requires_pixels = self.sinks.iter().any(|sink| sink.sink.requires_pixels());
+		Ok(())
+	}
+
 	fn finalize_sinks(self) -> Result<()> {
-		for sink in self.sinks {
-			sink.finish()?;
+		for active in self.sinks {
+			active.sink.finish()?;
 		}
 		Ok(())
 	}
@@ -420,8 +464,10 @@ mod tests {
 		}
 		fn accept(&mut self, ctx: Context<'_>) -> Result<()> {
 			self.frames.fetch_add(1, Ordering::Relaxed);
-			self.total_hold
-				.fetch_add(ctx.frame.hold_ticks as usize, Ordering::Relaxed);
+			self.total_hold.fetch_add(
+				usize::try_from(ctx.frame.hold_ticks).unwrap_or(usize::MAX),
+				Ordering::Relaxed,
+			);
 			if ctx.pixels.is_some() {
 				self.with_pixels.fetch_add(1, Ordering::Relaxed);
 			}
@@ -481,11 +527,10 @@ mod tests {
 		let (sender, receiver) = std::sync::mpsc::sync_channel(MAXIMUM_QUEUE_DEPTH);
 		for _ in 0..3 {
 			sender
-				.send(Frame {
+				.send(EncoderMessage::Frame(Frame {
 					snapshot: Arc::new(Snapshot::new(4, 4)),
 					hold_ticks: 2,
-					stills: Vec::new(),
-				})
+				}))
 				.unwrap();
 		}
 		drop(sender);
@@ -519,11 +564,10 @@ mod tests {
 		let (sender, receiver) = std::sync::mpsc::sync_channel(MAXIMUM_QUEUE_DEPTH);
 		for _ in 0..5 {
 			sender
-				.send(Frame {
+				.send(EncoderMessage::Frame(Frame {
 					snapshot: Arc::new(Snapshot::new(4, 4)),
 					hold_ticks: 1,
-					stills: Vec::new(),
-				})
+				}))
 				.unwrap();
 		}
 		drop(sender);
@@ -543,15 +587,74 @@ mod tests {
 		assert_eq!(pixels.load(Ordering::Relaxed), 0);
 	}
 
+	struct OneShot {
+		accepted: Arc<AtomicUsize>,
+		finished: Arc<AtomicUsize>,
+	}
+
+	impl Sink for OneShot {
+		fn requires_pixels(&self) -> bool {
+			true
+		}
+
+		fn begin(&mut self, _meta: &Metadata) -> Result<()> {
+			Ok(())
+		}
+
+		fn accept(&mut self, _context: Context<'_>) -> Result<()> {
+			self.accepted.fetch_add(1, Ordering::Relaxed);
+			Ok(())
+		}
+
+		fn finish(self: Box<Self>) -> Result<()> {
+			self.finished.fetch_add(1, Ordering::Relaxed);
+			Ok(())
+		}
+	}
+
+	#[test]
+	fn an_in_band_one_shot_sink_receives_only_the_next_frame() {
+		let accepted = Arc::new(AtomicUsize::new(0));
+		let finished = Arc::new(AtomicUsize::new(0));
+		let encoder = Encoder::new(
+			Box::new(CountingRasterizer(Arc::new(AtomicUsize::new(0)))),
+			Vec::new(),
+		);
+		let (sender, receiver) = std::sync::mpsc::sync_channel(MAXIMUM_QUEUE_DEPTH);
+		sender
+			.send(EncoderMessage::AddSink {
+				sink: Box::new(OneShot {
+					accepted: Arc::clone(&accepted),
+					finished: Arc::clone(&finished),
+				}),
+				one_shot: true,
+			})
+			.unwrap();
+		for _ in 0..2 {
+			sender
+				.send(EncoderMessage::Frame(Frame::new(
+					Arc::new(Snapshot::new(4, 4)),
+					1,
+				)))
+				.unwrap();
+		}
+		drop(sender);
+
+		encoder.run(receiver, meta()).unwrap();
+		assert_eq!(accepted.load(Ordering::Relaxed), 1);
+		assert_eq!(finished.load(Ordering::Relaxed), 1);
+	}
+
 	/// Capture must not wait on encoding. With a queue this deep, a producer
 	/// running well ahead of a slow consumer still never blocks.
 	#[test]
 	fn capture_does_not_block_on_a_slow_encoder() {
-		let (sender, receiver) = std::sync::mpsc::sync_channel::<Frame>(MAXIMUM_QUEUE_DEPTH);
+		let (sender, receiver) =
+			std::sync::mpsc::sync_channel::<EncoderMessage>(MAXIMUM_QUEUE_DEPTH);
 
 		let consumer = std::thread::spawn(move || {
 			let mut seen = 0usize;
-			for _frame in receiver {
+			for _message in receiver {
 				// Deliberately slower than the producer.
 				std::thread::sleep(std::time::Duration::from_micros(200));
 				seen += 1;
@@ -562,11 +665,10 @@ mod tests {
 		let started = std::time::Instant::now();
 		for _ in 0..MAXIMUM_QUEUE_DEPTH {
 			sender
-				.send(Frame {
+				.send(EncoderMessage::Frame(Frame {
 					snapshot: Arc::new(Snapshot::new(4, 4)),
 					hold_ticks: 1,
-					stills: Vec::new(),
-				})
+				}))
 				.unwrap();
 		}
 		let enqueue_time = started.elapsed();

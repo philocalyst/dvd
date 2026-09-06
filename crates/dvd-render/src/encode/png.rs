@@ -4,32 +4,10 @@
 //! author meant it to end — the command has run, the output is on screen — and
 //! the first frame is almost always an empty prompt.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use vello_cpu::Pixmap;
-
 use crate::stream::{Context as StreamContext, Metadata, Sink};
-
-/// Write a surface out as a PNG.
-///
-/// Shared with the `Screenshot` command, which needs exactly this and has no
-/// sink of its own.
-pub fn write(path: &Path, pixmap: &Pixmap) -> Result<()> {
-	if let Some(parent) = path
-		.parent()
-		.filter(|parent| !parent.as_os_str().is_empty())
-	{
-		std::fs::create_dir_all(parent)
-			.with_context(|| format!("creating {}", parent.display()))?;
-	}
-
-	let rgba = super::to_rgba_packed(pixmap);
-	image::RgbaImage::from_raw(pixmap.width() as u32, pixmap.height() as u32, rgba)
-		.context("the surface did not fill the image buffer")?
-		.save(path)
-		.with_context(|| format!("writing {}", path.display()))
-}
 
 pub struct Png {
 	path: PathBuf,
