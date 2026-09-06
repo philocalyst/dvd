@@ -61,6 +61,14 @@ const MACROBLOCK: u32 = 16;
 /// thousand roundings.
 const TICKS_PER_FRAME: u32 = 1000;
 
+fn sample_duration(hold_ticks: u64) -> Result<u32> {
+	let duration = hold_ticks
+		.max(1)
+		.checked_mul(u64::from(TICKS_PER_FRAME))
+		.context("video frame duration exceeds the MP4 time scale")?;
+	u32::try_from(duration).context("video frame duration exceeds MP4's 32-bit limit")
+}
+
 fn padded(value: u32) -> u32 {
 	value.div_ceil(MACROBLOCK) * MACROBLOCK
 }
@@ -343,7 +351,7 @@ impl Sink for Mp4 {
 
 		let sample = length_prefixed(&nal);
 
-		let duration = ctx.frame.hold_ticks.max(1) * TICKS_PER_FRAME;
+		let duration = sample_duration(ctx.frame.hold_ticks)?;
 		let writer = self
 			.writer
 			.as_mut()
@@ -368,7 +376,10 @@ impl Sink for Mp4 {
 			)
 			.context("writing a video sample")?;
 
-		self.elapsed += duration as u64;
+		self.elapsed = self
+			.elapsed
+			.checked_add(u64::from(duration))
+			.context("video timeline exceeds MP4 duration limits")?;
 		Ok(())
 	}
 
@@ -409,6 +420,16 @@ mod tests {
 	#[test]
 	fn the_default_profile_is_delta() {
 		assert_eq!(Mp4Profile::default(), Mp4Profile::Delta);
+	}
+
+	#[test]
+	fn sample_duration_rejects_values_that_do_not_fit_mp4() {
+		let maximum = u64::from(u32::MAX) / u64::from(TICKS_PER_FRAME);
+		assert_eq!(
+			sample_duration(maximum).unwrap(),
+			maximum as u32 * TICKS_PER_FRAME
+		);
+		assert!(sample_duration(maximum + 1).is_err());
 	}
 }
 

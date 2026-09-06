@@ -34,8 +34,8 @@ use super::font_embed;
 use crate::fonts::Fonts;
 use crate::geom::{Cell, Color, Frame, PixelRect, Point};
 use crate::grid::{Damage, Grid, GridOptions};
-use crate::model::Placement;
 use crate::model::Palette;
+use crate::model::Placement;
 use crate::outline::{GlyphKey, Outlines};
 use crate::paint::{self, Painter, Text};
 use crate::render::Surface;
@@ -133,8 +133,8 @@ impl VisualArtifact {
 /// How long an artifact stays on screen.
 #[derive(Clone, Copy, Debug)]
 struct Lifespan {
-	begin_milliseconds: u32,
-	duration_milliseconds: u32,
+	begin_milliseconds: u64,
+	duration_milliseconds: u64,
 }
 
 pub struct Svg {
@@ -155,7 +155,7 @@ pub struct Svg {
 	// The timeline.
 	active: HashMap<VisualArtifact, Lifespan>,
 	completed: Vec<(VisualArtifact, Lifespan)>,
-	now_milliseconds: u32,
+	now_milliseconds: u64,
 	frames_per_second: u32,
 
 	/// Every character drawn as real embedded-font text over the whole
@@ -201,13 +201,16 @@ impl Svg {
 
 	/// Extend the lifetime of everything still on screen, retire what is not,
 	/// and start the clock for whatever is new.
-	fn advance(&mut self, current: HashSet<VisualArtifact>, hold_milliseconds: u32) {
+	fn advance(&mut self, current: HashSet<VisualArtifact>, hold_milliseconds: u64) -> Result<()> {
 		let mut next = HashMap::with_capacity(current.len());
 
 		for artifact in current {
 			match self.active.remove(&artifact) {
 				Some(mut lifespan) => {
-					lifespan.duration_milliseconds += hold_milliseconds;
+					lifespan.duration_milliseconds = lifespan
+						.duration_milliseconds
+						.checked_add(hold_milliseconds)
+						.context("SVG artifact duration exceeds SVG timeline limits")?;
 					next.insert(artifact, lifespan);
 				}
 				None => {
@@ -225,7 +228,11 @@ impl Svg {
 		// Whatever is left was on screen last frame and is not on screen now.
 		self.completed.extend(self.active.drain());
 		self.active = next;
-		self.now_milliseconds += hold_milliseconds;
+		self.now_milliseconds = self
+			.now_milliseconds
+			.checked_add(hold_milliseconds)
+			.context("SVG timeline exceeds duration limits")?;
+		Ok(())
 	}
 
 	fn write_document(&self) -> String {
@@ -401,9 +408,14 @@ impl Sink for Svg {
 		// one step: `ticks * (1000 / fps)` loses up to a millisecond per frame
 		// to integer division at every frame rate that does not divide 1000,
 		// and a long recording accumulates that into visible drift.
-		let hold =
-			(context.frame.hold_ticks * 1000).div_ceil(self.frames_per_second);
-		self.advance(artifacts, hold);
+		let hold = context
+			.frame
+			.hold_ticks
+			.max(1)
+			.checked_mul(1_000)
+			.context("SVG frame duration exceeds the SVG timeline limits")?
+			.div_ceil(u64::from(self.frames_per_second));
+		self.advance(artifacts, hold)?;
 
 		Ok(())
 	}
@@ -536,7 +548,9 @@ impl SvgPainter<'_> {
 			Subrun::Outlined | Subrun::Drawn => (None, false),
 		};
 
-		let origin = self.frame.cell_origin(Cell::new(first_column, run.span.row));
+		let origin = self
+			.frame
+			.cell_origin(Cell::new(first_column, run.span.row));
 		self.artifacts.insert(VisualArtifact::TextRun {
 			x: origin.x.round() as i32,
 			y: baseline.round() as i32,
@@ -551,7 +565,13 @@ impl SvgPainter<'_> {
 
 	/// Draw one glyph as an outline `<use>`, for the narrow case a character
 	/// is not representable as `<text>`.
-	fn emit_outline(&mut self, glyph: &PlacedGlyph, origin: Point, color: Color, outlines: &Outlines) {
+	fn emit_outline(
+		&mut self,
+		glyph: &PlacedGlyph,
+		origin: Point,
+		color: Color,
+		outlines: &Outlines,
+	) {
 		let key = GlyphKey {
 			font: glyph.font.0,
 			glyph: glyph.identifier,
@@ -692,7 +712,9 @@ fn write_artifact(
 	// until its `begin`, so it has to start hidden — the base SVG default for
 	// a shape element is visible, and nothing else would suppress it.
 	let starts_hidden = lifespan.begin_milliseconds > 0;
-	let hide_at = lifespan.begin_milliseconds + lifespan.duration_milliseconds;
+	let hide_at = lifespan
+		.begin_milliseconds
+		.saturating_add(lifespan.duration_milliseconds);
 
 	// A `<text>` element's content must be written last: once `write_text`
 	// runs, `xmlwriter` has left the attributes phase and any attribute
@@ -813,7 +835,7 @@ fn write_opacity(xml: &mut XmlWriter, color: Color) {
 	}
 }
 
-fn write_set(xml: &mut XmlWriter, to: &str, at_milliseconds: u32) {
+fn write_set(xml: &mut XmlWriter, to: &str, at_milliseconds: u64) {
 	xml.start_element("set");
 	xml.write_attribute("attributeName", "display");
 	xml.write_attribute("to", to);
@@ -882,13 +904,18 @@ mod tests {
 		while let Some(start) = rest.find("<text") {
 			let after = &rest[start..];
 			let attributes_end = after.find('>').expect("a <text> element must be closed");
-			let end = after.find("</text>").expect("a <text> element must be ended");
+			let end = after
+				.find("</text>")
+				.expect("a <text> element must be ended");
 			let mut body = after[attributes_end + 1..end].to_string();
 			while let Some(set_start) = body.find("<set") {
 				let set_end = body[set_start..].find("/>").expect("<set> is self-closing");
 				body.replace_range(set_start..set_start + set_end + 2, "");
 			}
-			runs.push((after[..attributes_end].to_string(), body.replace("&amp;", "&")));
+			runs.push((
+				after[..attributes_end].to_string(),
+				body.replace("&amp;", "&"),
+			));
 			rest = &after[end..];
 		}
 
@@ -937,7 +964,8 @@ mod tests {
 				.expect("textLength is an integer");
 			let occupied = body.chars().count() as u32 * width;
 			assert_eq!(
-				declared, occupied,
+				declared,
+				occupied,
 				"run {body:?} declares {declared} but its {} characters occupy {occupied}",
 				body.chars().count()
 			);
@@ -1046,7 +1074,9 @@ mod tests {
 			"and retires none of the existing ones"
 		);
 		assert!(
-			svg.active.values().all(|life| life.duration_milliseconds > 20),
+			svg.active
+				.values()
+				.all(|life| life.duration_milliseconds > 20),
 			"their durations should have grown instead"
 		);
 	}

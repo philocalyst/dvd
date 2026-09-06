@@ -387,24 +387,7 @@ fn duration_from_seconds(seconds: f64) -> Result<Duration> {
 		seconds.is_finite() && seconds >= 0.0 && seconds <= MAX_ASCIICAST_DURATION.as_secs_f64(),
 		"asciicast time must be finite, non-negative, and at most 24 hours"
 	);
-	let whole_seconds = seconds.floor();
-	let whole_seconds = u64::try_from(whole_seconds as u128)
-		.context("asciicast time seconds exceed duration limits")?;
-	let fractional = seconds - whole_seconds as f64;
-	let nanos = ((fractional * 1_000_000_000.0).round()) as u64;
-	let (seconds, nanos) = if nanos == 1_000_000_000 {
-		(
-			whole_seconds
-				.checked_add(1)
-				.context("asciicast time exceeds duration limits")?,
-			0,
-		)
-	} else {
-		(whole_seconds, nanos)
-	};
-	Duration::from_secs(seconds)
-		.checked_add(Duration::from_nanos(nanos))
-		.context("asciicast time exceeds duration limits")
+	Duration::try_from_secs_f64(seconds).context("asciicast time exceeds duration limits")
 }
 
 fn read_line_bounded<R: BufRead>(reader: &mut R, line: &mut String) -> Result<usize> {

@@ -23,6 +23,7 @@ pub struct Gif {
 	fps: u64,
 	elapsed_ticks: u64,
 	written_centiseconds: u64,
+	pending_rgba: Option<Vec<u8>>,
 	frames: usize,
 	width: u16,
 	height: u16,
@@ -36,27 +37,39 @@ impl Gif {
 			fps: 0,
 			elapsed_ticks: 0,
 			written_centiseconds: 0,
+			pending_rgba: None,
 			frames: 0,
 			width: 0,
 			height: 0,
 		}
 	}
 
-	/// Convert capture ticks to GIF's centisecond clock without accumulating
-	/// rounding error between adjacent frames.
-	fn delay_for_ticks(&mut self, hold_ticks: u32) -> u16 {
-		self.elapsed_ticks = self
-			.elapsed_ticks
-			.saturating_add(u64::from(hold_ticks.max(1)));
-		let target = self
-			.elapsed_ticks
-			.saturating_mul(GIF_CENTISECONDS_PER_SECOND)
-			.saturating_add(self.fps / 2)
-			/ self.fps;
-		let desired = target.saturating_sub(self.written_centiseconds).max(1);
-		let delay = desired.min(u64::from(u16::MAX));
-		self.written_centiseconds = self.written_centiseconds.saturating_add(delay);
-		delay as u16
+	/// Convert the cumulative capture clock to GIF's centisecond clock without
+	/// accumulating rounding error between adjacent frames.
+	fn target_centiseconds(&self) -> Result<u64> {
+		self.elapsed_ticks
+			.checked_mul(GIF_CENTISECONDS_PER_SECOND)
+			.and_then(|ticks| ticks.checked_add(self.fps / 2))
+			.map(|ticks| ticks / self.fps)
+			.context("GIF timeline exceeds duration limits")
+	}
+
+	fn write_rgba(
+		&mut self,
+		encoder: &mut Encoder<BufWriter<File>>,
+		rgba: &mut [u8],
+		centiseconds: u64,
+	) -> Result<()> {
+		let mut remaining = centiseconds;
+		while remaining > 0 {
+			let delay = remaining.min(u64::from(u16::MAX)) as u16;
+			let mut frame = GifFrame::from_rgba_speed(self.width, self.height, rgba, 10);
+			frame.delay = delay;
+			encoder.write_frame(&frame).context("writing GIF frame")?;
+			self.frames = self.frames.saturating_add(1);
+			remaining -= u64::from(delay);
+		}
+		Ok(())
 	}
 }
 
@@ -91,6 +104,7 @@ impl Sink for Gif {
 		self.fps = u64::from(meta.frames_per_second);
 		self.elapsed_ticks = 0;
 		self.written_centiseconds = 0;
+		self.pending_rgba = None;
 		self.frames = 0;
 		self.width = meta.width;
 		self.height = meta.height;
@@ -106,23 +120,51 @@ impl Sink for Gif {
 		};
 
 		let mut rgba = crate::encode::to_rgba_packed(pixels);
-		let mut frame = GifFrame::from_rgba_speed(self.width, self.height, &mut rgba, 10);
-		frame.delay = self.delay_for_ticks(ctx.frame.hold_ticks);
-		encoder.write_frame(&frame).context("writing GIF frame")?;
-		self.frames += 1;
+		self.elapsed_ticks = self
+			.elapsed_ticks
+			.checked_add(ctx.frame.hold_ticks.max(1))
+			.context("GIF timeline exceeds duration limits")?;
+		let target = self.target_centiseconds()?;
+		if target > self.written_centiseconds {
+			if let Some(mut pending) = self.pending_rgba.take() {
+				self.write_rgba(
+					&mut encoder,
+					&mut pending,
+					target - self.written_centiseconds,
+				)?;
+				self.written_centiseconds = target;
+				self.pending_rgba = Some(rgba);
+			} else {
+				self.write_rgba(&mut encoder, &mut rgba, target - self.written_centiseconds)?;
+				self.written_centiseconds = target;
+			}
+		} else {
+			self.pending_rgba = Some(rgba);
+		}
 		self.encoder = Some(encoder);
 		Ok(())
 	}
 
 	fn finish(self: Box<Self>) -> Result<()> {
-		if self.frames == 0 {
+		let mut this = *self;
+		let mut encoder = this.encoder.take().context("GIF sink was not started")?;
+		if let Some(mut pending) = this.pending_rgba.take() {
+			let target = this.target_centiseconds()?;
+			let duration = target.saturating_sub(this.written_centiseconds);
+			if duration > 0 {
+				this.write_rgba(&mut encoder, &mut pending, duration)?;
+			} else if this.frames == 0 {
+				this.write_rgba(&mut encoder, &mut pending, 1)?;
+			}
+		}
+
+		if this.frames == 0 {
 			bail!(
 				"no frames were captured, so {} has nothing to show",
-				self.path.display()
+				this.path.display()
 			);
 		}
 
-		let encoder = self.encoder.context("GIF sink was not started")?;
 		let mut writer = encoder.into_inner().context("finishing GIF")?;
 		writer.flush().context("flushing GIF output")
 	}
@@ -146,10 +188,70 @@ mod tests {
 		let mut sink = Gif::new(PathBuf::from("test.gif"));
 		sink.fps = 60;
 
-		let delays: Vec<_> = (0..60).map(|_| sink.delay_for_ticks(1)).collect();
+		let targets: Vec<_> = (1..=60)
+			.map(|ticks| {
+				sink.elapsed_ticks = ticks;
+				sink.target_centiseconds().expect("target should fit")
+			})
+			.collect();
 
-		assert_eq!(delays.iter().map(|&delay| delay as u64).sum::<u64>(), 100);
-		assert!(delays.iter().all(|&delay| delay > 0));
+		assert_eq!(targets.last(), Some(&100));
+		assert!(targets.windows(2).all(|window| window[1] >= window[0]));
+	}
+
+	#[test]
+	fn high_rate_frames_are_coalesced_at_gifs_centisecond_precision() {
+		let path = std::env::temp_dir().join(format!(
+			"dvd-gif-high-rate-{}-{}.gif",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.expect("clock should be after the epoch")
+				.as_nanos()
+		));
+		let mut sink = Gif::new(path.clone());
+		sink.begin(&Metadata {
+			width: 1,
+			height: 1,
+			frames_per_second: 255,
+		})
+		.expect("begin");
+
+		let snapshot = Arc::new(Snapshot::new(1, 1));
+		for red in [0, 64, 128, 255] {
+			let mut pixmap = Pixmap::new(1, 1);
+			pixmap.data_mut()[0] = PremulRgba8 {
+				r: red,
+				g: 20,
+				b: 30,
+				a: 255,
+			};
+			let frame = Frame::new(Arc::clone(&snapshot), 1);
+			sink.accept(StreamContext {
+				frame: &frame,
+				pixels: Some(&pixmap),
+			})
+			.expect("accept");
+		}
+		Box::new(sink).finish().expect("finish");
+
+		let bytes = std::fs::read(&path).expect("GIF should exist");
+		let mut options = DecodeOptions::new();
+		options.set_color_output(ColorOutput::RGBA);
+		let mut reader = options
+			.read_info(Cursor::new(bytes))
+			.expect("GIF should decode");
+		let mut delays = Vec::new();
+		while let Some(frame) = reader.read_next_frame().expect("frame should decode") {
+			delays.push(frame.delay);
+		}
+		assert_eq!(
+			delays.len(),
+			2,
+			"four sub-centisecond frames should coalesce"
+		);
+		assert_eq!(delays.iter().map(|&delay| u64::from(delay)).sum::<u64>(), 2);
+		std::fs::remove_file(path).expect("test output should be removable");
 	}
 
 	#[test]
