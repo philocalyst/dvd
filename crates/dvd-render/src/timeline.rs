@@ -127,52 +127,47 @@ pub fn render_source<S: EventSource + ?Sized>(
 		height,
 		frames_per_second,
 	};
-	for sink in &mut sinks {
-		sink.begin(&metadata)?;
-	}
-
-	let initial = source.metadata().size;
-	let source_metadata = source.metadata().clone();
-	let mut clock = ReplayClock::new(source_metadata.idle_time_limit);
-	let mut terminal = Terminal::new(initial);
-	let mut deduplicator = Deduplicator::new(Level::new());
-	let mut pixels = Pixmap::new(width, height);
-	let needs_pixels = sinks.iter().any(|sink| sink.requires_pixels());
-	let mut buffered = None;
-	let mut source_done = false;
-	let mut replay_end = None;
-	let mut held: Option<Arc<Snapshot>> = None;
-	let mut hold_ticks = 0u64;
-	let mut tick = 0u64;
-
-	loop {
-		while !source_done {
-			if buffered.is_none() {
-				buffered = source
-					.next_event()?
-					.map(|event| clock.map_event(event))
-					.transpose()?;
-				if buffered.is_none() {
-					source_done = true;
-					replay_end = Some(clock.finish(source_metadata.duration)?);
-					break;
-				}
-			}
-			let event = buffered.as_ref().expect("buffered event was just checked");
-			let event_tick = tick_for_time(event.time, options.frames_per_second);
-			if event_tick > tick {
-				break;
-			}
-			let event = buffered.take().expect("buffered event was just checked");
-			terminal.apply(event, initial, options.resize_policy)?;
+	let result = (|| -> Result<()> {
+		for sink in &mut sinks {
+			sink.begin(&metadata)?;
 		}
 
-		if let Some(next_tick) = buffered
-			.as_ref()
-			.map(|event| tick_for_time(event.time, options.frames_per_second))
-			.or_else(|| replay_end.map(|time| tick_for_time(time, options.frames_per_second)))
-			.filter(|next_tick| *next_tick > tick)
-		{
+		let initial = source.metadata().size;
+		let source_metadata = source.metadata().clone();
+		let mut clock = ReplayClock::new(source_metadata.idle_time_limit);
+		let mut terminal = Terminal::new(initial);
+		let mut deduplicator = Deduplicator::new(Level::new());
+		let mut pixels = Pixmap::new(width, height);
+		let needs_pixels = sinks.iter().any(|sink| sink.requires_pixels());
+		let mut buffered = None;
+		let mut source_done = false;
+		let mut replay_end = None;
+		let mut held: Option<Arc<Snapshot>> = None;
+		let mut hold_ticks = 0u64;
+		let mut tick = 0u64;
+
+		loop {
+			while !source_done {
+				if buffered.is_none() {
+					buffered = source
+						.next_event()?
+						.map(|event| clock.map_event(event))
+						.transpose()?;
+					if buffered.is_none() {
+						source_done = true;
+						replay_end = Some(clock.finish(source_metadata.duration)?);
+						break;
+					}
+				}
+				let event = buffered.as_ref().expect("buffered event was just checked");
+				let event_tick = tick_for_time(event.time, options.frames_per_second);
+				if event_tick > tick {
+					break;
+				}
+				let event = buffered.take().expect("buffered event was just checked");
+				terminal.apply(event, initial, options.resize_policy)?;
+			}
+
 			observe(
 				rasterizer,
 				&mut sinks,
@@ -184,45 +179,45 @@ pub fn render_source<S: EventSource + ?Sized>(
 				&mut terminal,
 				initial,
 			)?;
-			let skipped = next_tick - tick - 1;
-			add_hold(&mut hold_ticks, skipped)?;
-			tick = next_tick;
-			continue;
+
+			if let Some(next_tick) = buffered
+				.as_ref()
+				.map(|event| tick_for_time(event.time, options.frames_per_second))
+				.or_else(|| replay_end.map(|time| tick_for_time(time, options.frames_per_second)))
+				.filter(|next_tick| *next_tick > tick)
+			{
+				let skipped = next_tick - tick - 1;
+				add_hold(&mut hold_ticks, skipped)?;
+				tick = next_tick;
+				continue;
+			}
+
+			if source_done
+				&& buffered.is_none()
+				&& replay_end
+					.is_some_and(|end| tick >= tick_for_time(end, options.frames_per_second))
+			{
+				break;
+			}
+			tick = tick
+				.checked_add(1)
+				.context("replay timeline has too many frames")?;
 		}
 
-		observe(
-			rasterizer,
-			&mut sinks,
-			&mut pixels,
-			needs_pixels,
-			&mut held,
-			&mut hold_ticks,
-			&mut deduplicator,
-			&mut terminal,
-			initial,
-		)?;
-
-		if source_done
-			&& buffered.is_none()
-			&& replay_end.is_some_and(|end| tick >= tick_for_time(end, options.frames_per_second))
-		{
-			break;
+		if let Some(snapshot) = held {
+			draw(
+				rasterizer,
+				&mut sinks,
+				&mut pixels,
+				Frame::new(snapshot, hold_ticks),
+				needs_pixels,
+			)?;
 		}
-		tick = tick
-			.checked_add(1)
-			.context("replay timeline has too many frames")?;
-	}
+		Ok(())
+	})();
 
-	if let Some(snapshot) = held {
-		draw(
-			rasterizer,
-			&mut sinks,
-			&mut pixels,
-			Frame::new(snapshot, hold_ticks),
-			needs_pixels,
-		)?;
-	}
-	finish_sinks(sinks)
+	let finish_result = finish_sinks(sinks);
+	result.and(finish_result)
 }
 
 fn observe(
@@ -268,10 +263,13 @@ fn tick_for_time(time: Duration, frames_per_second: u32) -> u64 {
 }
 
 fn finish_sinks(sinks: Vec<Box<dyn Sink>>) -> Result<()> {
+	let mut failure = None;
 	for sink in sinks {
-		sink.finish()?;
+		if let Err(error) = sink.finish() {
+			failure.get_or_insert(error);
+		}
 	}
-	Ok(())
+	failure.map_or(Ok(()), Err)
 }
 
 fn draw(
@@ -406,6 +404,7 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::sync::atomic::{AtomicUsize, Ordering};
 
 	#[test]
 	fn sample_clock_does_not_accumulate_fractional_frames() {
@@ -501,5 +500,84 @@ mod tests {
 	fn tick_for_time_rounds_up_without_iterating_the_idle_interval() {
 		assert_eq!(tick_for_time(Duration::from_millis(1), 30), 1);
 		assert_eq!(tick_for_time(Duration::from_secs(1), 30), 30);
+	}
+
+	struct FailingSource {
+		metadata: crate::source::TerminalMetadata,
+	}
+
+	impl crate::source::EventSource for FailingSource {
+		fn metadata(&self) -> &crate::source::TerminalMetadata {
+			&self.metadata
+		}
+
+		fn next_event(&mut self) -> Result<Option<TimedTerminalEvent>> {
+			Err(anyhow::anyhow!("source failed"))
+		}
+	}
+
+	struct FinishingSink {
+		finished: Arc<AtomicUsize>,
+		error: bool,
+	}
+
+	impl Sink for FinishingSink {
+		fn requires_pixels(&self) -> bool {
+			false
+		}
+
+		fn begin(&mut self, _metadata: &Metadata) -> Result<()> {
+			Ok(())
+		}
+
+		fn accept(&mut self, _context: SinkContext<'_>) -> Result<()> {
+			Ok(())
+		}
+
+		fn finish(self: Box<Self>) -> Result<()> {
+			self.finished.fetch_add(1, Ordering::Relaxed);
+			if self.error {
+				Err(anyhow::anyhow!("sink failed"))
+			} else {
+				Ok(())
+			}
+		}
+	}
+
+	#[test]
+	fn source_errors_still_finish_every_sink_and_preserve_source_error() {
+		let finished = Arc::new(AtomicUsize::new(0));
+		let mut source = FailingSource {
+			metadata: crate::source::TerminalMetadata::new(TerminalSize::new(2, 1)),
+		};
+		let mut rasterizer = TestRasterizer;
+		let result = render_source(
+			&mut source,
+			&mut rasterizer,
+			vec![
+				Box::new(FinishingSink {
+					finished: Arc::clone(&finished),
+					error: false,
+				}),
+				Box::new(FinishingSink {
+					finished: Arc::clone(&finished),
+					error: true,
+				}),
+			],
+			TimelineOptions::default(),
+		);
+
+		assert_eq!(result.unwrap_err().to_string(), "source failed");
+		assert_eq!(finished.load(Ordering::Relaxed), 2);
+	}
+
+	struct TestRasterizer;
+
+	impl Rasterizer for TestRasterizer {
+		fn dimensions(&self) -> (u16, u16) {
+			(2, 2)
+		}
+
+		fn render(&mut self, _snapshot: &Snapshot, _target: &mut Pixmap) {}
 	}
 }

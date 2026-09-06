@@ -192,6 +192,10 @@ impl<R: Read> EventSource for AsciicastSource<R> {
 				.checked_add(stamp)
 				.context("asciicast v3 timeline exceeds duration limits")?,
 		};
+		ensure!(
+			time <= MAX_ASCIICAST_DURATION,
+			"asciicast timeline exceeds the maximum duration of 24 hours"
+		);
 		self.last_time = time;
 
 		let code = tuple[1]
@@ -526,6 +530,15 @@ mod tests {
 		for seconds in [f64::NAN, f64::INFINITY, -1.0, 86_400.1, 1.0e300] {
 			assert!(duration_from_seconds(seconds).is_err());
 		}
+	}
+
+	#[test]
+	fn v3_rejects_a_cumulative_timeline_longer_than_one_day() {
+		let input = "{\"version\":3,\"term\":{\"cols\":80,\"rows\":24}}\n[86400,\"o\",\"one\"]\n[0.001,\"o\",\"too late\"]\n";
+		let mut source = AsciicastSource::new(Cursor::new(input)).unwrap();
+
+		source.next_event().unwrap();
+		assert!(source.next_event().is_err());
 	}
 
 	#[test]
