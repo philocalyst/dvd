@@ -11,6 +11,7 @@
 //! Resolving a cell to colours and attributes is deferred to the renderer,
 //! which does it once per *distinct* frame rather than once per captured tick.
 
+use anyhow::Context;
 use rio_vt::config::colors::{AnsiColor, ColorRgb, Colors, NamedColor, term::List};
 use rio_vt::crosswords::grid::row::Row;
 use rio_vt::crosswords::pos::CursorState;
@@ -20,6 +21,7 @@ use rustc_hash::FxHashMap;
 
 use crate::geom::Color;
 use crate::grid::GridOptions;
+use crate::source::TerminalTheme;
 
 /// An image decoded from Sixel, iTerm2 or the Kitty graphics protocol, placed
 /// somewhere on the screen.
@@ -266,6 +268,70 @@ impl Palette {
 		}
 	}
 
+	/// Build the renderer palette captured in an asciicast header.
+	///
+	/// The terminal theme is deliberately converted at this boundary: the VT
+	/// model still owns its normal defaults, while every named colour and the
+	/// two explicit foreground/background colours reach both raster and SVG
+	/// sinks unchanged. An eight-colour palette leaves the bright half at the
+	/// VT default because the recording did not capture those entries.
+	pub fn from_terminal_theme(theme: &TerminalTheme) -> anyhow::Result<Self> {
+		let foreground = parse_terminal_colour(&theme.foreground, "foreground")?;
+		let background = parse_terminal_colour(&theme.background, "background")?;
+		let palette = theme
+			.palette
+			.split(':')
+			.enumerate()
+			.map(|(index, colour)| parse_terminal_colour(colour, &format!("palette entry {index}")))
+			.collect::<anyhow::Result<Vec<_>>>()?;
+		anyhow::ensure!(
+			matches!(palette.len(), 8 | 16),
+			"terminal palette must contain 8 or 16 colours, got {}",
+			palette.len()
+		);
+
+		let mut colors = Colors::default();
+		colors.foreground = foreground;
+		colors.background = (background, terminal_colour(background));
+		colors.cursor = foreground;
+		colors.vi_cursor = foreground;
+		let [black, red, green, yellow, blue, magenta, cyan, white] = palette[..8]
+			.try_into()
+			.expect("validated eight base colours");
+		colors.black = black;
+		colors.red = red;
+		colors.green = green;
+		colors.yellow = yellow;
+		colors.blue = blue;
+		colors.magenta = magenta;
+		colors.cyan = cyan;
+		colors.white = white;
+		if palette.len() == 16 {
+			let [
+				light_black,
+				light_red,
+				light_green,
+				light_yellow,
+				light_blue,
+				light_magenta,
+				light_cyan,
+				light_white,
+			] = palette[8..]
+				.try_into()
+				.expect("validated eight bright colours");
+			colors.light_black = light_black;
+			colors.light_red = light_red;
+			colors.light_green = light_green;
+			colors.light_yellow = light_yellow;
+			colors.light_blue = light_blue;
+			colors.light_magenta = light_magenta;
+			colors.light_cyan = light_cyan;
+			colors.light_white = light_white;
+		}
+
+		Ok(Self::from_colors(&colors))
+	}
+
 	/// The colour a bare `AnsiColor` names.
 	#[inline]
 	pub fn lookup(&self, color: AnsiColor) -> Color {
@@ -329,6 +395,36 @@ impl Palette {
 			flags: style.flags,
 			wide: cell.wide(),
 		}
+	}
+}
+
+fn parse_terminal_colour(value: &str, name: &str) -> anyhow::Result<[f32; 4]> {
+	let digits = value
+		.strip_prefix('#')
+		.with_context(|| format!("terminal {name} colour must be #rrggbb"))?;
+	anyhow::ensure!(
+		digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()),
+		"terminal {name} colour must be #rrggbb, got {value:?}"
+	);
+	let channel = |range: std::ops::Range<usize>| {
+		u8::from_str_radix(&digits[range], 16)
+			.with_context(|| format!("terminal {name} colour contains invalid hex"))
+	};
+	let [red, green, blue] = [channel(0..2)?, channel(2..4)?, channel(4..6)?];
+	Ok([
+		red as f32 / 255.0,
+		green as f32 / 255.0,
+		blue as f32 / 255.0,
+		1.0,
+	])
+}
+
+fn terminal_colour(colour: [f32; 4]) -> rio_graphics::Color {
+	rio_graphics::Color {
+		r: f64::from(colour[0]) * 255.0,
+		g: f64::from(colour[1]) * 255.0,
+		b: f64::from(colour[2]) * 255.0,
+		a: 255.0,
 	}
 }
 
@@ -466,5 +562,41 @@ mod tests {
 
 		b.cells[3] = Square::from_char('z');
 		assert!(!a.same_picture(&b));
+	}
+
+	#[test]
+	fn asciicast_theme_reaches_named_and_background_colours_exactly() {
+		let palette = Palette::from_terminal_theme(&TerminalTheme {
+			foreground: "#102030".into(),
+			background: "#405060".into(),
+			palette: "#010203:#112233:#223344:#334455:#445566:#556677:#667788:#778899:#8899aa:#99aabb:#aabbcc:#bbccdd:#ccddee:#ddeeff:#eeffff:#ffffff".into(),
+		})
+		.expect("theme should parse");
+
+		assert_eq!(
+			palette.named(NamedColor::Foreground),
+			Color::rgb(0x10, 0x20, 0x30)
+		);
+		assert_eq!(
+			palette.named(NamedColor::Background),
+			Color::rgb(0x40, 0x50, 0x60)
+		);
+		assert_eq!(palette.named(NamedColor::Red), Color::rgb(0x11, 0x22, 0x33));
+		assert_eq!(
+			palette.named(NamedColor::LightWhite),
+			Color::rgb(0xff, 0xff, 0xff)
+		);
+	}
+
+	#[test]
+	fn asciicast_theme_rejects_invalid_colour_lists() {
+		let error = Palette::from_terminal_theme(&TerminalTheme {
+			foreground: "#ffffff".into(),
+			background: "#000000".into(),
+			palette: "#000000".into(),
+		})
+		.unwrap_err()
+		.to_string();
+		assert!(error.contains("8 or 16"));
 	}
 }

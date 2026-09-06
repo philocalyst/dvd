@@ -74,7 +74,13 @@ pub fn render(recording: &Path, destination: &Path) -> Result<()> {
 	let fonts = Fonts::resolve(None, 18.0, 1.0)?;
 	let family = fonts.family.clone();
 	let font_size = fonts.size;
-	let palette = Palette::from_colors(&theme::resolve("dracula")?.colors());
+	let palette = source
+		.metadata()
+		.theme
+		.clone()
+		.map(|theme| Palette::from_terminal_theme(&theme))
+		.transpose()?
+		.unwrap_or(Palette::from_colors(&theme::resolve("dracula")?.colors()));
 	let options = GridOptions::default();
 	let surface = Surface::default();
 	let mut renderer = Renderer::new(

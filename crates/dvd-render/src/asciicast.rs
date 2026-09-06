@@ -8,9 +8,10 @@
 use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value};
 
+use crate::model::Palette;
 use crate::source::{
 	EventSource, TerminalEvent, TerminalMetadata, TerminalSize, TerminalTheme, TimedTerminalEvent,
 };
@@ -55,15 +56,19 @@ impl<R: Read> AsciicastSource<R> {
 			3 => AsciicastVersion::V3,
 			version => bail!("unsupported asciicast version {version}"),
 		};
-		let size = match version {
-			AsciicastVersion::V2 => TerminalSize::new(
+		let term = match version {
+			AsciicastVersion::V2 => None,
+			AsciicastVersion::V3 => Some(required_object(header, "term")?),
+		};
+		let size = match (version, term) {
+			(AsciicastVersion::V2, _) => TerminalSize::new(
 				required_u16(header, "width")?,
 				required_u16(header, "height")?,
 			),
-			AsciicastVersion::V3 => {
-				let term = required_object(header, "term")?;
+			(AsciicastVersion::V3, Some(term)) => {
 				TerminalSize::new(required_u16(term, "cols")?, required_u16(term, "rows")?)
 			}
+			(AsciicastVersion::V3, None) => unreachable!("v3 always has a term object"),
 		};
 
 		let mut metadata = TerminalMetadata::new(size);
@@ -73,10 +78,11 @@ impl<R: Read> AsciicastSource<R> {
 		metadata.title = optional_string(header, "title")?;
 		metadata.environment = optional_string_map(header, "env")?;
 		metadata.tags = optional_string_array(header, "tags")?;
-		metadata.theme = optional_theme(match version {
-			AsciicastVersion::V2 => header,
-			AsciicastVersion::V3 => required_object(header, "term")?,
-		})?;
+		if let Some(term) = term {
+			metadata.terminal_type = optional_string(term, "type")?;
+			metadata.terminal_version = optional_string(term, "version")?;
+		}
+		metadata.theme = optional_theme(term.unwrap_or(header))?;
 
 		let known: &[&str] = match version {
 			AsciicastVersion::V2 => &[
@@ -298,11 +304,13 @@ fn optional_theme(object: &Map<String, Value>) -> Result<Option<TerminalTheme>> 
 	let theme = theme
 		.as_object()
 		.context("asciicast theme must be an object")?;
-	Ok(Some(TerminalTheme {
+	let theme = TerminalTheme {
 		foreground: required_string(theme, "fg")?,
 		background: required_string(theme, "bg")?,
 		palette: required_string(theme, "palette")?,
-	}))
+	};
+	Palette::from_terminal_theme(&theme).context("invalid asciicast terminal theme")?;
+	Ok(Some(theme))
 }
 
 fn required_string(object: &Map<String, Value>, key: &str) -> Result<String> {
@@ -369,7 +377,7 @@ mod tests {
 
 	#[test]
 	fn v2_uses_absolute_times_and_preserves_unknown_events() {
-		let input = r##"{"version":2,"width":80,"height":24,"title":"demo","theme":{"fg":"#fff","bg":"#000","palette":"#000:#fff"}}
+		let input = r##"{"version":2,"width":80,"height":24,"title":"demo","theme":{"fg":"#ffffff","bg":"#000000","palette":"#000000:#ffffff:#111111:#222222:#333333:#444444:#555555:#666666"}}
 [1.25,"o","hello"]
 [2.5,"future",{"chapter":1}]
 "##;
@@ -399,13 +407,18 @@ mod tests {
 
 	#[test]
 	fn v3_accumulates_intervals_and_accepts_comments_and_final_line() {
-		let input = r##"{"version":3,"term":{"cols":10,"rows":4,"type":"xterm","theme":{"fg":"#fff","bg":"#000","palette":"#000"}}}
+		let input = r##"{"version":3,"term":{"cols":10,"rows":4,"type":"xterm","version":"VTE(7802)","theme":{"fg":"#ffffff","bg":"#000000","palette":"#000000:#111111:#222222:#333333:#444444:#555555:#666666:#777777"}}}
 # stream begins
 [0.25,"o","a"]
 [0.75,"i","b"]
 [1.0,"r","20x8"]
 [0.0,"x",0]"##;
 		let mut source = AsciicastSource::new(Cursor::new(input)).unwrap();
+		assert_eq!(source.metadata().terminal_type.as_deref(), Some("xterm"));
+		assert_eq!(
+			source.metadata().terminal_version.as_deref(),
+			Some("VTE(7802)")
+		);
 		let first = source.next_event().unwrap().unwrap();
 		assert_eq!(first.time, Duration::from_millis(250));
 		assert_eq!(
@@ -429,5 +442,11 @@ mod tests {
 		let mut source = AsciicastSource::new(Cursor::new(input)).unwrap();
 		source.next_event().unwrap();
 		assert!(source.next_event().is_err());
+	}
+
+	#[test]
+	fn malformed_terminal_theme_is_rejected_before_streaming() {
+		let input = r##"{"version":3,"term":{"cols":10,"rows":4,"theme":{"fg":"#fff","bg":"#000000","palette":"#000000:#111111:#222222:#333333:#444444:#555555:#666666:#777777"}}}"##;
+		assert!(AsciicastSource::new(Cursor::new(input)).is_err());
 	}
 }
