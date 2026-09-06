@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 
-use dvd_render::encode::{mp4::Mp4, png::Png, svg::Svg};
+use dvd_render::encode::{gif::Gif, mp4::Mp4, png::Png, svg::Svg};
 use dvd_render::fonts::Fonts;
 use dvd_render::geom::Color;
 use dvd_render::grid::GridOptions;
@@ -292,6 +292,7 @@ impl Outputs {
 			.iter()
 			.map(|(path, format)| -> Result<Box<dyn Sink>> {
 				Ok(match format {
+					Output::Gif => Box::new(Gif::new(path.clone())),
 					Output::Png => Box::new(Png::new(path.clone())),
 					Output::Mp4 => Box::new(Mp4::new(
 						path.clone(),

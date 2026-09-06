@@ -18,16 +18,15 @@ pub struct Cli {
 
 /// The formats an output path can name.
 ///
-/// Three, and each earns its place: `mp4` is the H.264 video, `png` a single
-/// still, `svg` a self-contained animation that stays sharp at any size and is
-/// selectable as text. The container formats the old list accepted (`mov`,
-/// `mkv`, `webm`, and `gif`) all promised muxers or codecs this pipeline does
-/// not carry, so naming one produced a file that never appeared.
+/// Four, and each earns its place: `mp4` is the H.264 video, `gif` an animated
+/// image, `png` a single still, and `svg` a self-contained animation that stays
+/// sharp at any size and is selectable as text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, strum::Display, strum::VariantNames)]
 #[strum(serialize_all = "lowercase")]
 pub enum Output {
 	#[default]
 	Mp4,
+	Gif,
 	Png,
 	Svg,
 }
@@ -41,7 +40,7 @@ impl Output {
 
 	pub fn from_extension(extension: &str) -> Option<Self> {
 		let lower = extension.to_lowercase();
-		[Self::Mp4, Self::Png, Self::Svg]
+		[Self::Mp4, Self::Gif, Self::Png, Self::Svg]
 			.into_iter()
 			.find(|format| format.to_string() == lower)
 	}
@@ -178,6 +177,7 @@ mod tests {
 	fn output_from_str_accepts_every_allowed_extension_case_insensitively() {
 		assert_eq!("mp4".parse(), Ok(Output::Mp4));
 		assert_eq!("MP4".parse(), Ok(Output::Mp4));
+		assert_eq!("gif".parse(), Ok(Output::Gif));
 		assert_eq!("png".parse(), Ok(Output::Png));
 		assert_eq!("svg".parse(), Ok(Output::Svg));
 	}
@@ -187,7 +187,7 @@ mod tests {
 	/// to say what *would* have worked.
 	#[test]
 	fn output_from_str_names_the_allowed_extensions_when_it_rejects() {
-		let error = "gif".parse::<Output>().unwrap_err();
+		let error = "webm".parse::<Output>().unwrap_err();
 		for extension in Output::allowed_extensions() {
 			assert!(
 				error.contains(extension),
@@ -201,7 +201,7 @@ mod tests {
 	/// through the CLI (`--output` reparsed from a printed default) honest.
 	#[test]
 	fn every_output_variant_round_trips_through_display_and_from_str() {
-		for variant in [Output::Mp4, Output::Png, Output::Svg] {
+		for variant in [Output::Mp4, Output::Gif, Output::Png, Output::Svg] {
 			assert_eq!(variant.to_string().parse(), Ok(variant));
 		}
 	}
@@ -243,7 +243,7 @@ mod tests {
 
 	#[test]
 	fn render_requires_a_supported_output_extension() {
-		let error = Cli::try_parse_from(["dvd", "render", "session.dvdrec", "video.gif"])
+		let error = Cli::try_parse_from(["dvd", "render", "session.dvdrec", "video.webm"])
 			.err()
 			.expect("an unsupported extension should be rejected")
 			.to_string();

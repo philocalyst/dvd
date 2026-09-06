@@ -55,6 +55,7 @@ vello_cpu = { version = "0.1", default-features = false, features = [
 fearless_simd = "0.4"
 
 image = { version = "0.25", default-features = false, features = ["png"] }
+gif = "0.14"
 less-avc = { version = "0.1.5", features = ["std"] }
 mp4 = "0.14"
 xmlwriter = "0.1"

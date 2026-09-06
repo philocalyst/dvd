@@ -1,6 +1,6 @@
 //! Where a recording ends up.
 //!
-//! Three sinks, and the split between them is not cosmetic. [`png`] and [`mp4`]
+//! Four sinks, and the split between them is not cosmetic. [`png`], [`gif`], and [`mp4`]
 //! consume the rasterized surface; [`svg`] consumes the model and never asks
 //! for pixels at all, which is what lets a tape whose only output is an SVG skip
 //! rasterization for the whole recording (see [`crate::stream::Encoder`]).
@@ -9,6 +9,7 @@
 //! [`Pixmap`] into the straight RGBA every encoder actually wants.
 
 mod font_embed;
+pub mod gif;
 mod h264;
 pub mod mp4;
 pub mod png;

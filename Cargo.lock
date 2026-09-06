@@ -514,6 +514,7 @@ dependencies = [
  "crossbeam",
  "fearless_simd",
  "flate2",
+ "gif",
  "image",
  "less-avc",
  "mp4",

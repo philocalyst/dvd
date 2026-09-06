@@ -416,7 +416,7 @@ impl<'lexer, 'source> Parser<'lexer, 'source> {
 		let format = match Path::new(&literal).extension() {
 			// Rejected here, at parse time, rather than left for `burn` to
 			// discover after the PTY is open — `dvd check` should catch
-			// `Output out.gif` as surely as a missing quote.
+			// `Output out.bmp` as surely as a missing quote.
 			Some(extension) => extension
 				.to_string_lossy()
 				.parse::<Output>()
@@ -931,6 +931,7 @@ mod tests {
 	#[case("Output out.mp4", Output::Mp4, "out.mp4")]
 	#[case("Output OUT.MP4", Output::Mp4, "OUT.MP4")] // extension match is case-insensitive
 	#[case("Output frame.png", Output::Png, "frame.png")]
+	#[case("Output animation.gif", Output::Gif, "animation.gif")]
 	#[case("Output movie.svg", Output::Svg, "movie.svg")]
 	#[case("Output stills/", Output::Png, "stills/")] // a trailing slash is a folder of PNG stills
 	fn output_infers_its_format_from_the_extension(
@@ -958,7 +959,7 @@ mod tests {
 	/// allowed extensions rather than failing later once the PTY is open.
 	#[test]
 	fn an_unsupported_output_extension_is_rejected_naming_the_alternatives() {
-		let (commands, errors) = tape::parse("Output out.gif");
+		let (commands, errors) = tape::parse("Output out.bmp");
 		assert!(
 			errors[0].message.contains("mp4"),
 			"error should name allowed extensions: {errors:?}"

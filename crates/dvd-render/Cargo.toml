@@ -20,6 +20,7 @@ vello_cpu.workspace = true
 fearless_simd.workspace = true
 
 image.workspace = true
+gif.workspace = true
 less-avc.workspace = true
 
 mp4.workspace = true
