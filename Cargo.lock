@@ -524,6 +524,7 @@ dependencies = [
  "rio-vt",
  "rstest",
  "rustc-hash",
+ "serde_json",
  "skrifa 0.45.1",
  "subsetter",
  "teletypewriter",

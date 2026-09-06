@@ -26,6 +26,7 @@ mp4.workspace = true
 xmlwriter.workspace = true
 base64.workspace = true
 flate2.workspace = true
+serde_json.workspace = true
 corcovado = "0.5.5"
 rio-graphics = "0.5.5"
 subsetter.workspace = true
