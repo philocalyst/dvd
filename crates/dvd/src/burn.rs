@@ -336,25 +336,24 @@ pub fn burn(args: &BurnArgs) -> Result<()> {
 
 	let mut plan = plan(commands)?;
 
-	// The path on the command line is an output like any other, and it is the
-	// one the user typed most recently, so it goes last. Its extension is
-	// already known to be one of `Output::allowed_extensions()` — clap's
-	// `value_parser` rejected anything else before `burn` ever ran.
-	if !plan
-		.outputs
-		.iter()
-		.any(|(path, _)| path == &args.output_file)
-	{
-		let format = args
-			.output_file
+	merge_cli_outputs(&mut plan, &args.output_files)?;
+
+	record(plan)
+}
+
+fn merge_cli_outputs(plan: &mut Plan, paths: &[PathBuf]) -> Result<()> {
+	for path in paths {
+		if plan.outputs.iter().any(|(existing, _)| existing == path) {
+			continue;
+		}
+		let format = path
 			.extension()
 			.and_then(|extension| extension.to_str())
 			.and_then(Output::from_extension)
-			.expect("clap's value_parser already validated this extension");
-		plan.outputs.push((args.output_file.clone(), format));
+			.with_context(|| format!("unsupported output path {}", path.display()))?;
+		plan.outputs.push((path.clone(), format));
 	}
-
-	record(plan)
+	Ok(())
 }
 
 fn record(plan: Plan) -> Result<()> {
@@ -1162,6 +1161,32 @@ mod tests {
 		assert_eq!(plan.settings.theme, "nord");
 		assert_eq!(plan.outputs, vec![(PathBuf::from("out.mp4"), Output::Mp4)]);
 		assert_eq!(plan.steps.len(), 2, "Type and Enter are the only steps");
+	}
+
+	#[test]
+	fn cli_outputs_merge_with_tape_outputs_without_duplicates() {
+		let (commands, errors) = tape::parse("Output shared.svg\nOutput tape.gif");
+		assert!(errors.is_empty(), "{errors:?}");
+
+		let mut plan = plan(commands).unwrap();
+		merge_cli_outputs(
+			&mut plan,
+			&[
+				PathBuf::from("shared.svg"),
+				PathBuf::from("cli.mp4"),
+				PathBuf::from("tape.gif"),
+			],
+		)
+		.unwrap();
+
+		assert_eq!(
+			plan.outputs,
+			vec![
+				(PathBuf::from("shared.svg"), Output::Svg),
+				(PathBuf::from("tape.gif"), Output::Gif),
+				(PathBuf::from("cli.mp4"), Output::Mp4),
+			]
+		);
 	}
 
 	#[test]

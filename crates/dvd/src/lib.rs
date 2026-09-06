@@ -22,7 +22,6 @@ pub fn run(cli: cli::Cli) -> ExitCode {
 		cli::Commands::Themes { markdown } => themes(*markdown),
 		cli::Commands::Play { files } => replay::play(files),
 		cli::Commands::Render { recording, outputs } => replay::render(recording, outputs),
-		cli::Commands::New { .. } => Err(anyhow::anyhow!("new is not yet implemented")),
 	};
 
 	match result {

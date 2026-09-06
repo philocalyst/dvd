@@ -5,13 +5,12 @@ use strum::VariantNames;
 
 #[derive(Parser)]
 #[command(name = "dvd")]
-#[command(about = "Manage your .dvd or .tape files")]
+#[command(
+	about = "Render terminal sessions from asciicast, VHS, and DVD tapes",
+	long_about = "Render terminal sessions from asciicast streams and VHS/DVD tapes.\n\nInputs can be files or stdin; outputs can be combined as SVG, GIF, MP4, or PNG.\n\nExamples:\n  dvd render demo.cast demo.svg demo.gif\n  asciinema rec --output-hook 'dvd render - demo.svg demo.gif' demo.cast\n  dvd burn demo.tape demo.svg demo.mp4\n  cat demo.dvd | dvd burn - demo.gif"
+)]
 #[command(version)]
 pub struct Cli {
-	/// Quiet - do not log messages
-	#[arg(short, long, global = true)]
-	pub quiet: bool,
-
 	#[command(subcommand)]
 	pub command: Commands,
 }
@@ -89,6 +88,7 @@ pub enum Commands {
 		markdown: bool,
 	},
 
+	/// Run a VHS/DVD tape from a file or stdin and write one or more outputs
 	Burn(BurnArgs),
 
 	/// Replay asciicast files in the controlling terminal
@@ -98,19 +98,13 @@ pub enum Commands {
 		files: Vec<PathBuf>,
 	},
 
-	/// Render an asciicast file after it has been captured
+	/// Render an asciicast file or stdin into one or more outputs
 	Render {
 		/// Asciicast source to render (`-` reads standard input)
 		recording: PathBuf,
 		/// One or more output files (mp4, gif, png, or svg)
 		#[arg(required = true, value_parser = validate_output_path)]
 		outputs: Vec<PathBuf>,
-	},
-
-	/// Create a new tape file with example tape file contents and documentation
-	New {
-		/// Name of the new tape file
-		name: String,
 	},
 
 	/// Validate a glob file path and parses all the files to ensure they are valid without running them
@@ -123,15 +117,18 @@ pub enum Commands {
 
 #[derive(Args)]
 pub struct BurnArgs {
-	/// Input tape file (use "-" for stdin)
+	/// VHS/DVD tape file (use "-" for stdin)
 	pub input_file: PathBuf,
 
-	/// File name(s) of video output
+	/// One or more output files (mp4, gif, png, or svg)
 	#[arg(
+		required = true,
+		num_args = 1..,
+		value_name = "OUTPUT",
 		value_parser = validate_output_path,
 		value_hint = clap::ValueHint::FilePath
 	)]
-	pub output_file: PathBuf,
+	pub output_files: Vec<PathBuf>,
 }
 
 #[cfg(test)]
@@ -199,6 +196,20 @@ mod tests {
 				assert_eq!(outputs[1], PathBuf::from("terminal.gif"));
 			}
 			_ => panic!("expected render command"),
+		}
+	}
+
+	#[test]
+	fn burn_accepts_multiple_output_destinations() {
+		let cli = Cli::try_parse_from(["dvd", "burn", "demo.tape", "terminal.svg", "terminal.gif"])
+			.expect("burn should accept one or more output paths");
+
+		match cli.command {
+			Commands::Burn(args) => {
+				assert_eq!(args.input_file, PathBuf::from("demo.tape"));
+				assert_eq!(args.output_files.len(), 2);
+			}
+			_ => panic!("expected burn command"),
 		}
 	}
 }
