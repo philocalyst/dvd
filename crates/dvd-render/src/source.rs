@@ -41,10 +41,13 @@ pub struct TerminalTheme {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TerminalMetadata {
 	pub size: TerminalSize,
+	/// The complete source duration, including inactivity after the last event.
+	pub duration: Option<Duration>,
 	pub terminal_type: Option<String>,
 	pub terminal_version: Option<String>,
 	pub timestamp: Option<u64>,
-	pub idle_time_limit: Option<f64>,
+	/// Maximum delay between source events when replaying this recording.
+	pub idle_time_limit: Option<Duration>,
 	pub command: Option<String>,
 	pub title: Option<String>,
 	pub environment: BTreeMap<String, String>,
@@ -57,6 +60,7 @@ impl TerminalMetadata {
 	pub fn new(size: TerminalSize) -> Self {
 		Self {
 			size,
+			duration: None,
 			terminal_type: None,
 			terminal_version: None,
 			timestamp: None,

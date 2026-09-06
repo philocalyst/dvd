@@ -16,6 +16,19 @@ use crate::source::{
 	EventSource, TerminalEvent, TerminalMetadata, TerminalSize, TerminalTheme, TimedTerminalEvent,
 };
 
+/// Maximum size of one NDJSON record accepted from an asciicast stream.
+///
+/// This bounds both parser allocation and the amount of untrusted JSON handed
+/// to serde. A recording with larger terminal output should split it into
+/// multiple output events instead.
+pub const MAX_ASCIICAST_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum decoded payload in one input or output event.
+pub const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum source duration supported by the frame-based outputs.
+pub const MAX_ASCIICAST_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// The two asciicast versions understood by this reader.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AsciicastVersion {
@@ -37,9 +50,8 @@ impl<R: Read> AsciicastSource<R> {
 	pub fn new(reader: R) -> Result<Self> {
 		let mut reader = BufReader::new(reader);
 		let mut line = String::new();
-		let bytes = reader
-			.read_line(&mut line)
-			.context("reading asciicast header")?;
+		let bytes =
+			read_line_bounded(&mut reader, &mut line).context("reading asciicast header")?;
 		ensure!(bytes != 0, "asciicast is missing its header");
 		ensure!(
 			!line.trim_start().starts_with('#'),
@@ -73,7 +85,8 @@ impl<R: Read> AsciicastSource<R> {
 
 		let mut metadata = TerminalMetadata::new(size);
 		metadata.timestamp = optional_u64(header, "timestamp")?;
-		metadata.idle_time_limit = optional_nonnegative_f64(header, "idle_time_limit")?;
+		metadata.duration = optional_duration(header, "duration")?;
+		metadata.idle_time_limit = optional_duration(header, "idle_time_limit")?;
 		metadata.command = optional_string(header, "command")?;
 		metadata.title = optional_string(header, "title")?;
 		metadata.environment = optional_string_map(header, "env")?;
@@ -101,6 +114,7 @@ impl<R: Read> AsciicastSource<R> {
 				"version",
 				"term",
 				"timestamp",
+				"duration",
 				"idle_time_limit",
 				"command",
 				"title",
@@ -131,9 +145,7 @@ impl<R: Read> AsciicastSource<R> {
 		let mut line = String::new();
 		loop {
 			line.clear();
-			let bytes = self
-				.reader
-				.read_line(&mut line)
+			let bytes = read_line_bounded(&mut self.reader, &mut line)
 				.with_context(|| format!("reading asciicast line {}", self.line + 1))?;
 			if bytes == 0 {
 				return Ok(None);
@@ -236,16 +248,14 @@ fn optional_u64(object: &Map<String, Value>, key: &str) -> Result<Option<u64>> {
 	})
 }
 
-fn optional_nonnegative_f64(object: &Map<String, Value>, key: &str) -> Result<Option<f64>> {
+fn optional_duration(object: &Map<String, Value>, key: &str) -> Result<Option<Duration>> {
 	object.get(key).map_or(Ok(None), |value| {
 		let value = value
 			.as_f64()
 			.with_context(|| format!("asciicast header field {key:?} must be a number"))?;
-		ensure!(
-			value.is_finite() && value >= 0.0,
-			"asciicast {key} must be non-negative"
-		);
-		Ok(Some(value))
+		duration_from_seconds(value)
+			.with_context(|| format!("invalid asciicast {key}"))
+			.map(Some)
 	})
 }
 
@@ -329,7 +339,12 @@ fn event_string(value: &Value, name: &str) -> Result<String> {
 }
 
 fn event_bytes(value: &Value, name: &str) -> Result<Vec<u8>> {
-	Ok(event_string(value, name)?.into_bytes())
+	let value = event_string(value, name)?;
+	ensure!(
+		value.len() <= MAX_EVENT_PAYLOAD_BYTES,
+		"asciicast {name} payload exceeds {MAX_EVENT_PAYLOAD_BYTES} bytes"
+	);
+	Ok(value.into_bytes())
 }
 
 fn parse_size(value: &Value) -> Result<TerminalSize> {
@@ -369,10 +384,53 @@ fn parse_exit(value: &Value) -> Result<Option<i32>> {
 
 fn duration_from_seconds(seconds: f64) -> Result<Duration> {
 	ensure!(
-		seconds.is_finite() && seconds >= 0.0 && seconds <= Duration::MAX.as_secs_f64(),
-		"asciicast time must be finite and non-negative"
+		seconds.is_finite() && seconds >= 0.0 && seconds <= MAX_ASCIICAST_DURATION.as_secs_f64(),
+		"asciicast time must be finite, non-negative, and at most 24 hours"
 	);
-	Ok(Duration::from_secs_f64(seconds))
+	let whole_seconds = seconds.floor();
+	let whole_seconds = u64::try_from(whole_seconds as u128)
+		.context("asciicast time seconds exceed duration limits")?;
+	let fractional = seconds - whole_seconds as f64;
+	let nanos = ((fractional * 1_000_000_000.0).round()) as u64;
+	let (seconds, nanos) = if nanos == 1_000_000_000 {
+		(
+			whole_seconds
+				.checked_add(1)
+				.context("asciicast time exceeds duration limits")?,
+			0,
+		)
+	} else {
+		(whole_seconds, nanos)
+	};
+	Duration::from_secs(seconds)
+		.checked_add(Duration::from_nanos(nanos))
+		.context("asciicast time exceeds duration limits")
+}
+
+fn read_line_bounded<R: BufRead>(reader: &mut R, line: &mut String) -> Result<usize> {
+	let mut bytes = Vec::new();
+	loop {
+		let chunk = reader.fill_buf().context("reading asciicast line")?;
+		if chunk.is_empty() {
+			break;
+		}
+		let end = chunk.iter().position(|byte| *byte == b'\n');
+		let take = end.map_or(chunk.len(), |index| index + 1);
+		ensure!(
+			bytes.len().saturating_add(take) <= MAX_ASCIICAST_LINE_BYTES,
+			"asciicast line exceeds {MAX_ASCIICAST_LINE_BYTES} bytes"
+		);
+		bytes.extend_from_slice(&chunk[..take]);
+		reader.consume(take);
+		if end.is_some() {
+			break;
+		}
+	}
+	if bytes.is_empty() {
+		return Ok(0);
+	}
+	*line = String::from_utf8(bytes).context("asciicast line is not UTF-8")?;
+	Ok(line.len())
 }
 
 #[cfg(test)]
@@ -462,5 +520,37 @@ mod tests {
 	fn malformed_terminal_theme_is_rejected_before_streaming() {
 		let input = r##"{"version":3,"term":{"cols":10,"rows":4,"theme":{"fg":"#fff","bg":"#000000","palette":"#000000:#111111:#222222:#333333:#444444:#555555:#666666:#777777"}}}"##;
 		assert!(AsciicastSource::new(Cursor::new(input)).is_err());
+	}
+
+	#[test]
+	fn v2_duration_and_idle_limit_are_retained_as_checked_durations() {
+		let input = r#"{"version":2,"width":80,"height":24,"duration":12.5,"idle_time_limit":1.25}
+[0,"o","ok"]
+"#;
+		let source = AsciicastSource::new(Cursor::new(input)).unwrap();
+		assert_eq!(
+			source.metadata().duration,
+			Some(Duration::from_millis(12_500))
+		);
+		assert_eq!(
+			source.metadata().idle_time_limit,
+			Some(Duration::from_millis(1_250))
+		);
+	}
+
+	#[test]
+	fn non_finite_or_excessive_times_are_rejected_without_panicking() {
+		for seconds in [f64::NAN, f64::INFINITY, -1.0, 86_400.1, 1.0e300] {
+			assert!(duration_from_seconds(seconds).is_err());
+		}
+	}
+
+	#[test]
+	fn oversized_payloads_are_rejected_at_the_event_boundary() {
+		let payload = "x".repeat(MAX_EVENT_PAYLOAD_BYTES + 1);
+		let input =
+			format!("{{\"version\":2,\"width\":80,\"height\":24}}\n[0,\"o\",\"{payload}\"]\n");
+		let mut source = AsciicastSource::new(Cursor::new(input)).unwrap();
+		assert!(source.next_event().is_err());
 	}
 }
