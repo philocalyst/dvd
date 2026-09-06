@@ -65,15 +65,6 @@ impl FromStr for Output {
 	}
 }
 
-fn default_shell() -> String {
-	std::env::var("SHELL")
-		.unwrap_or_else(|_| "/bin/bash".to_string())
-		.split('/')
-		.next_back()
-		.unwrap_or("bash")
-		.to_string()
-}
-
 fn validate_output_path(path_str: &str) -> Result<PathBuf, String> {
 	let path = PathBuf::from(path_str);
 	let extension = path
@@ -89,19 +80,6 @@ fn validate_output_path(path_str: &str) -> Result<PathBuf, String> {
 	Ok(path)
 }
 
-/// A source recording has one durable journal format.  Keeping this separate
-/// from [`validate_output_path`] makes a mistyped tape or video path fail
-/// before raw mode and the PTY are opened.
-fn validate_recording_path(path_str: &str) -> Result<PathBuf, String> {
-	let path = PathBuf::from(path_str);
-	let extension = path.extension().and_then(|extension| extension.to_str());
-	if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("dvdrec")) {
-		Ok(path)
-	} else {
-		Err(format!("recording source {path_str:?} must end in .dvdrec"))
-	}
-}
-
 #[derive(Subcommand)]
 pub enum Commands {
 	/// List all the available themes, one per line
@@ -113,31 +91,18 @@ pub enum Commands {
 
 	Burn(BurnArgs),
 
-	/// Record an interactive terminal session into a durable .dvdrec file
-	Record {
-		/// Session recording to create
-		#[arg(value_parser = validate_recording_path)]
-		recording: PathBuf,
-		/// Shell for recording
-		#[arg(short, long, default_value_t = default_shell())]
-		shell: String,
-		/// Store typed input as well as terminal output
-		#[arg(long)]
-		capture_input: bool,
-	},
-
-	/// Replay recording files in the controlling terminal
+	/// Replay asciicast files in the controlling terminal
 	Play {
-		/// Recording files to play sequentially
+		/// Asciicast files to play sequentially (`-` reads standard input)
 		#[arg(required = true)]
 		files: Vec<PathBuf>,
 	},
 
-	/// Render a recording file after it has been captured
+	/// Render an asciicast file after it has been captured
 	Render {
-		/// Recording file to render
+		/// Asciicast source to render (`-` reads standard input)
 		recording: PathBuf,
-		/// Output file (mp4, png, or svg)
+		/// Output file (mp4, gif, png, or svg)
 		#[arg(value_parser = validate_output_path)]
 		output: PathBuf,
 	},
@@ -207,43 +172,8 @@ mod tests {
 	}
 
 	#[test]
-	fn record_accepts_a_durable_source_and_capture_input() {
-		let cli = Cli::try_parse_from([
-			"dvd",
-			"record",
-			"session.DVDREC",
-			"--shell",
-			"zsh",
-			"--capture-input",
-		])
-		.unwrap();
-
-		match cli.command {
-			Commands::Record {
-				recording,
-				shell,
-				capture_input,
-			} => {
-				assert_eq!(recording, PathBuf::from("session.DVDREC"));
-				assert_eq!(shell, "zsh");
-				assert!(capture_input);
-			}
-			_ => panic!("record command should parse as Record"),
-		}
-	}
-
-	#[test]
-	fn record_rejects_a_source_without_the_dvdrec_extension() {
-		let error = Cli::try_parse_from(["dvd", "record", "session.mp4"])
-			.err()
-			.expect("a non-recording source should be rejected")
-			.to_string();
-		assert!(error.contains("must end in .dvdrec"));
-	}
-
-	#[test]
 	fn render_requires_a_supported_output_extension() {
-		let error = Cli::try_parse_from(["dvd", "render", "session.dvdrec", "video.webm"])
+		let error = Cli::try_parse_from(["dvd", "render", "session.cast", "video.webm"])
 			.err()
 			.expect("an unsupported extension should be rejected")
 			.to_string();

@@ -1,5 +1,6 @@
 //! `dvd`: the tape language, the CLI, and the pipeline that drives one against
-//! a terminal.
+//! a terminal. Persisted session capture belongs to asciinema; DVD consumes
+//! asciicast streams for playback and rendering.
 //!
 //! Everything that touches a PTY, a glyph or an encoder lives in `dvd-render`.
 //! This crate reads a tape, turns it into commands, and feeds them to that
@@ -9,7 +10,6 @@ pub mod cli;
 pub mod tape;
 
 mod burn;
-mod record;
 mod replay;
 mod theme;
 
@@ -20,11 +20,6 @@ pub fn run(cli: cli::Cli) -> ExitCode {
 		cli::Commands::Check { files } => check(files),
 		cli::Commands::Burn(args) => burn::burn(args),
 		cli::Commands::Themes { markdown } => themes(*markdown),
-		cli::Commands::Record {
-			recording,
-			shell,
-			capture_input,
-		} => record::record(shell, recording.clone(), *capture_input),
 		cli::Commands::Play { files } => replay::play(files),
 		cli::Commands::Render { recording, output } => replay::render(recording, output),
 		cli::Commands::New { .. } => Err(anyhow::anyhow!("new is not yet implemented")),
