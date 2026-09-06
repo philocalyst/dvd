@@ -32,6 +32,7 @@ use rio_vt::ansi::CursorShape;
 use rio_vt::config::colors::NamedColor;
 use rio_vt::crosswords::square::Wide;
 use rio_vt::crosswords::style::StyleFlags;
+use rustc_hash::FxHashMap;
 
 use crate::geom::{Cell, Color, Span};
 use crate::model::{Palette, Placement, ResolvedCell, Snapshot};
@@ -46,6 +47,9 @@ pub struct Grid {
 	cells: Vec<ResolvedCell>,
 	pub cursor: Option<Caret>,
 	pub graphics: Vec<Placement>,
+	/// Zero-width characters keyed by the ids carried in resolved cells.
+	/// Keeping these out of [`ResolvedCell`] preserves its compact `Copy` shape.
+	extras: FxHashMap<u16, Vec<char>>,
 	/// The panel colour, read once per fill so [`Grid::background_runs`] does
 	/// not have to ask the palette again for every row.
 	pub background: Color,
@@ -56,6 +60,7 @@ impl Grid {
 	pub fn new(columns: u16, rows: u16) -> Self {
 		let blank = ResolvedCell {
 			character: ' ',
+			extras_id: None,
 			foreground: Color::TRANSPARENT,
 			background: Color::TRANSPARENT,
 			underline: None,
@@ -69,6 +74,7 @@ impl Grid {
 			cells: vec![blank; columns as usize * rows as usize],
 			cursor: None,
 			graphics: Vec::new(),
+			extras: FxHashMap::default(),
 			background: Color::TRANSPARENT,
 		}
 	}
@@ -100,6 +106,19 @@ impl Grid {
 		self.graphics.clear();
 		self.graphics.extend(snapshot.graphics.iter().cloned());
 
+		self.extras.clear();
+		for cell in &self.cells {
+			let Some(id) = cell.extras_id else {
+				continue;
+			};
+			let Some(extras) = snapshot.extras.get(&id) else {
+				continue;
+			};
+			if !extras.zerowidth.is_empty() {
+				self.extras.insert(id, extras.zerowidth.clone());
+			}
+		}
+
 		// After the cells, because the caret's width is a property of the
 		// character underneath it.
 		self.cursor = Caret::resolve(snapshot, &self.cells, self.columns, palette);
@@ -112,6 +131,14 @@ impl Grid {
 	pub fn row(&self, row: u16) -> &[ResolvedCell] {
 		let start = row as usize * self.columns as usize;
 		&self.cells[start..start + self.columns as usize]
+	}
+
+	/// The zero-width characters attached to a resolved cell.
+	#[inline]
+	pub fn zero_width(&self, cell: &ResolvedCell) -> &[char] {
+		cell.extras_id
+			.and_then(|id| self.extras.get(&id))
+			.map_or(&[], Vec::as_slice)
 	}
 
 	/// Horizontal runs of one background colour, skipping the panel colour.

@@ -312,6 +312,10 @@ fn row_hash(grid: &Grid, row: u16) -> u64 {
 		(cell.flags & (StyleFlags::BOLD | StyleFlags::ITALIC))
 			.bits()
 			.hash(&mut hasher);
+		grid.zero_width(cell).len().hash(&mut hasher);
+		for mark in grid.zero_width(cell) {
+			mark.hash(&mut hasher);
+		}
 	}
 
 	hasher.finish()
@@ -341,6 +345,16 @@ fn row_text(grid: &Grid, row: u16) -> (String, Vec<u16>) {
 		// `text.len()` is a byte length, so this maps every byte of a
 		// multi-byte character onto the one column it came from.
 		column_by_byte_index.resize(text.len(), column as u16);
+
+		// Rio keeps combining marks in an out-of-line extras table. Append them
+		// here, mapping every byte back to the base column so shaping can place
+		// the complete grapheme without advancing the terminal grid.
+		if !cell.flags.contains(StyleFlags::HIDDEN) {
+			for mark in grid.zero_width(cell) {
+				text.push(*mark);
+				column_by_byte_index.resize(text.len(), column as u16);
+			}
+		}
 	}
 
 	(text, column_by_byte_index)

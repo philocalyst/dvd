@@ -213,6 +213,10 @@ impl Snapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedCell {
 	pub character: char,
+	/// The snapshot extras table entry, when this cell carries zero-width
+	/// characters. The table itself stays on [`crate::grid::Grid`] so resolved
+	/// cells remain small and copyable.
+	pub extras_id: Option<u16>,
 	pub foreground: Color,
 	pub background: Color,
 	/// Explicit underline colour (SGR 58), when the cell sets one.
@@ -389,6 +393,7 @@ impl Palette {
 			} else {
 				cell.c()
 			},
+			extras_id: cell.extras_id(),
 			foreground,
 			background,
 			underline: style.underline_color.map(|color| self.lookup(color)),
