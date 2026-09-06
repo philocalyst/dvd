@@ -60,16 +60,22 @@ pub fn play(paths: &[PathBuf]) -> Result<()> {
 }
 
 /// Render an asciicast source through the same timeline used by every source.
-pub fn render(recording: &Path, destination: &Path) -> Result<()> {
+pub fn render(recording: &Path, destinations: &[PathBuf]) -> Result<()> {
 	let mut source = open_source(recording)?;
 	let size = source.metadata().size;
-	let format = destination
-		.extension()
-		.and_then(|part| part.to_str())
-		.and_then(Output::from_extension)
-		.ok_or_else(|| {
-			anyhow::anyhow!("{} must be mp4, gif, png, or svg", destination.display())
-		})?;
+	let outputs = destinations
+		.iter()
+		.map(|destination| {
+			let format = destination
+				.extension()
+				.and_then(|part| part.to_str())
+				.and_then(Output::from_extension)
+				.ok_or_else(|| {
+					anyhow::anyhow!("{} must be mp4, gif, png, or svg", destination.display())
+				})?;
+			Ok((destination.clone(), format))
+		})
+		.collect::<Result<Vec<_>>>()?;
 	let level = Level::new();
 	let fonts = Fonts::resolve(None, 18.0, 1.0)?;
 	let family = fonts.family.clone();
@@ -103,7 +109,7 @@ pub fn render(recording: &Path, destination: &Path) -> Result<()> {
 		rows: size.rows,
 		level,
 	}
-	.sinks(&[(destination.to_path_buf(), format)])?;
+	.sinks(&outputs)?;
 	timeline::render_source(
 		&mut *source,
 		&mut renderer,
@@ -113,7 +119,9 @@ pub fn render(recording: &Path, destination: &Path) -> Result<()> {
 			resize_policy: ResizePolicy::Clip,
 		},
 	)?;
-	println!("wrote {}", destination.display());
+	for (destination, _) in &outputs {
+		println!("wrote {}", destination.display());
+	}
 	Ok(())
 }
 

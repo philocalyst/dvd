@@ -102,9 +102,9 @@ pub enum Commands {
 	Render {
 		/// Asciicast source to render (`-` reads standard input)
 		recording: PathBuf,
-		/// Output file (mp4, gif, png, or svg)
-		#[arg(value_parser = validate_output_path)]
-		output: PathBuf,
+		/// One or more output files (mp4, gif, png, or svg)
+		#[arg(required = true, value_parser = validate_output_path)]
+		outputs: Vec<PathBuf>,
 	},
 
 	/// Create a new tape file with example tape file contents and documentation
@@ -178,5 +178,27 @@ mod tests {
 			.expect("an unsupported extension should be rejected")
 			.to_string();
 		assert!(error.contains("unsupported output format"));
+	}
+
+	#[test]
+	fn render_accepts_multiple_output_destinations() {
+		let cli = Cli::try_parse_from([
+			"dvd",
+			"render",
+			"session.cast",
+			"terminal.svg",
+			"terminal.gif",
+			"terminal.mp4",
+		])
+		.expect("render should accept one or more output paths");
+
+		match cli.command {
+			Commands::Render { recording, outputs } => {
+				assert_eq!(recording, PathBuf::from("session.cast"));
+				assert_eq!(outputs.len(), 3);
+				assert_eq!(outputs[1], PathBuf::from("terminal.gif"));
+			}
+			_ => panic!("expected render command"),
+		}
 	}
 }
