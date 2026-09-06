@@ -351,9 +351,15 @@ fn parse_exit(value: &Value) -> Result<Option<i32>> {
 	if value.is_null() {
 		return Ok(None);
 	}
-	let status = value
-		.as_i64()
-		.context("asciicast exit status must be an integer or null")?;
+	let status = if let Some(status) = value.as_str() {
+		status
+			.parse::<i64>()
+			.context("asciicast exit status string must contain an integer")?
+	} else {
+		value
+			.as_i64()
+			.context("asciicast exit status must be an integer, string, or null")?
+	};
 	ensure!(
 		status >= 0 && status <= i32::MAX as i64,
 		"asciicast exit status is out of range"
@@ -412,7 +418,7 @@ mod tests {
 [0.25,"o","a"]
 [0.75,"i","b"]
 [1.0,"r","20x8"]
-[0.0,"x",0]"##;
+[0.0,"x","0"]"##;
 		let mut source = AsciicastSource::new(Cursor::new(input)).unwrap();
 		assert_eq!(source.metadata().terminal_type.as_deref(), Some("xterm"));
 		assert_eq!(
@@ -442,6 +448,14 @@ mod tests {
 		let mut source = AsciicastSource::new(Cursor::new(input)).unwrap();
 		source.next_event().unwrap();
 		assert!(source.next_event().is_err());
+	}
+
+	#[test]
+	fn exit_status_accepts_canonical_strings_and_legacy_values() {
+		assert_eq!(parse_exit(&serde_json::json!("7")).unwrap(), Some(7));
+		assert_eq!(parse_exit(&serde_json::json!(7)).unwrap(), Some(7));
+		assert_eq!(parse_exit(&Value::Null).unwrap(), None);
+		assert!(parse_exit(&serde_json::json!("-1")).is_err());
 	}
 
 	#[test]
