@@ -16,7 +16,7 @@ use dvd_render::grid::GridOptions;
 use dvd_render::model::Palette;
 use dvd_render::render::{Renderer, Surface};
 use dvd_render::source::{EventSource, TerminalEvent};
-use dvd_render::timeline::{self, ResizePolicy, TimelineOptions};
+use dvd_render::timeline::{self, ReplayClock, ResizePolicy, TimelineOptions};
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -36,8 +36,14 @@ pub fn play(paths: &[PathBuf]) -> Result<()> {
 			stdin_used = true;
 		}
 		let mut source = open_source(path)?;
+		let metadata = source.metadata().clone();
+		let mut clock = ReplayClock::new(metadata.idle_time_limit);
 		let started = Instant::now();
-		while let Some(event) = source.next_event()? {
+		while let Some(event) = source
+			.next_event()?
+			.map(|event| clock.map_event(event))
+			.transpose()?
+		{
 			if let Some(wait) = event.time.checked_sub(started.elapsed()) {
 				std::thread::sleep(wait);
 			}
@@ -54,6 +60,10 @@ pub fn play(paths: &[PathBuf]) -> Result<()> {
 				| TerminalEvent::Unknown { .. } => {}
 			}
 			output.flush().context("flushing terminal output")?;
+		}
+		let end = clock.finish(metadata.duration)?;
+		if let Some(wait) = end.checked_sub(started.elapsed()) {
+			std::thread::sleep(wait);
 		}
 	}
 	Ok(())

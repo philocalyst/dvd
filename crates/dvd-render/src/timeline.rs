@@ -35,6 +35,64 @@ pub struct TimelineOptions {
 	pub resize_policy: ResizePolicy,
 }
 
+/// Converts source timestamps into replay timestamps while applying the
+/// asciicast idle-time policy uniformly to every consumer.
+#[derive(Clone, Debug)]
+pub struct ReplayClock {
+	idle_time_limit: Option<Duration>,
+	source_time: Duration,
+	replay_time: Duration,
+}
+
+impl ReplayClock {
+	pub fn new(idle_time_limit: Option<Duration>) -> Self {
+		Self {
+			idle_time_limit,
+			source_time: Duration::ZERO,
+			replay_time: Duration::ZERO,
+		}
+	}
+
+	pub fn map_event(&mut self, mut event: TimedTerminalEvent) -> Result<TimedTerminalEvent> {
+		ensure!(
+			event.time >= self.source_time,
+			"event source returned an event before the previous timestamp"
+		);
+		let gap = event.time - self.source_time;
+		let gap = self.idle_time_limit.map_or(gap, |limit| gap.min(limit));
+		self.replay_time = self
+			.replay_time
+			.checked_add(gap)
+			.context("replay timeline exceeds duration limits")?;
+		self.source_time = event.time;
+		event.time = self.replay_time;
+		Ok(event)
+	}
+
+	/// Return the end of the replay, including a header's final idle period.
+	pub fn finish(&mut self, source_duration: Option<Duration>) -> Result<Duration> {
+		let Some(source_duration) = source_duration else {
+			return Ok(self.replay_time);
+		};
+		ensure!(
+			source_duration >= self.source_time,
+			"recording duration precedes its final event"
+		);
+		let gap = source_duration - self.source_time;
+		let gap = self.idle_time_limit.map_or(gap, |limit| gap.min(limit));
+		self.replay_time = self
+			.replay_time
+			.checked_add(gap)
+			.context("replay timeline exceeds duration limits")?;
+		self.source_time = source_duration;
+		Ok(self.replay_time)
+	}
+
+	pub fn replay_time(&self) -> Duration {
+		self.replay_time
+	}
+}
+
 impl Default for TimelineOptions {
 	fn default() -> Self {
 		Self {
@@ -74,58 +132,85 @@ pub fn render_source<S: EventSource + ?Sized>(
 	}
 
 	let initial = source.metadata().size;
+	let source_metadata = source.metadata().clone();
+	let mut clock = ReplayClock::new(source_metadata.idle_time_limit);
 	let mut terminal = Terminal::new(initial);
 	let mut deduplicator = Deduplicator::new(Level::new());
 	let mut pixels = Pixmap::new(width, height);
 	let needs_pixels = sinks.iter().any(|sink| sink.requires_pixels());
 	let mut buffered = None;
 	let mut source_done = false;
-	let mut previous_time = Duration::ZERO;
+	let mut replay_end = None;
 	let mut held: Option<Arc<Snapshot>> = None;
-	let mut hold_ticks = 0;
+	let mut hold_ticks = 0u64;
+	let mut tick = 0u64;
 
-	for tick in 0u64.. {
-		let time = sample_time(tick, options.frames_per_second);
+	loop {
 		while !source_done {
 			if buffered.is_none() {
-				buffered = source.next_event()?;
+				buffered = source
+					.next_event()?
+					.map(|event| clock.map_event(event))
+					.transpose()?;
 				if buffered.is_none() {
 					source_done = true;
+					replay_end = Some(clock.finish(source_metadata.duration)?);
 					break;
 				}
 			}
 			let event = buffered.as_ref().expect("buffered event was just checked");
-			ensure!(
-				event.time >= previous_time,
-				"event source returned an event before the previous timestamp"
-			);
-			if event.time > time {
+			let event_tick = tick_for_time(event.time, options.frames_per_second);
+			if event_tick > tick {
 				break;
 			}
 			let event = buffered.take().expect("buffered event was just checked");
-			previous_time = event.time;
 			terminal.apply(event, initial, options.resize_policy)?;
 		}
 
-		let snapshot = Arc::new(fit_snapshot(terminal.snapshot(), initial));
-		if deduplicator.admit(&snapshot) {
-			if let Some(previous) = held.replace(snapshot) {
-				draw(
-					rasterizer,
-					&mut sinks,
-					&mut pixels,
-					Frame::new(previous, hold_ticks),
-					needs_pixels,
-				)?;
-			}
-			hold_ticks = 1;
-		} else {
-			hold_ticks = hold_ticks.saturating_add(1);
+		if let Some(next_tick) = buffered
+			.as_ref()
+			.map(|event| tick_for_time(event.time, options.frames_per_second))
+			.or_else(|| replay_end.map(|time| tick_for_time(time, options.frames_per_second)))
+			.filter(|next_tick| *next_tick > tick)
+		{
+			observe(
+				rasterizer,
+				&mut sinks,
+				&mut pixels,
+				needs_pixels,
+				&mut held,
+				&mut hold_ticks,
+				&mut deduplicator,
+				&mut terminal,
+				initial,
+			)?;
+			let skipped = next_tick - tick - 1;
+			add_hold(&mut hold_ticks, skipped)?;
+			tick = next_tick;
+			continue;
 		}
 
-		if source_done && buffered.is_none() {
+		observe(
+			rasterizer,
+			&mut sinks,
+			&mut pixels,
+			needs_pixels,
+			&mut held,
+			&mut hold_ticks,
+			&mut deduplicator,
+			&mut terminal,
+			initial,
+		)?;
+
+		if source_done
+			&& buffered.is_none()
+			&& replay_end.is_some_and(|end| tick >= tick_for_time(end, options.frames_per_second))
+		{
 			break;
 		}
+		tick = tick
+			.checked_add(1)
+			.context("replay timeline has too many frames")?;
 	}
 
 	if let Some(snapshot) = held {
@@ -138,6 +223,48 @@ pub fn render_source<S: EventSource + ?Sized>(
 		)?;
 	}
 	finish_sinks(sinks)
+}
+
+fn observe(
+	rasterizer: &mut dyn Rasterizer,
+	sinks: &mut [Box<dyn Sink>],
+	pixels: &mut Pixmap,
+	needs_pixels: bool,
+	held: &mut Option<Arc<Snapshot>>,
+	hold_ticks: &mut u64,
+	deduplicator: &mut Deduplicator,
+	terminal: &mut Terminal,
+	initial: TerminalSize,
+) -> Result<()> {
+	let snapshot = Arc::new(fit_snapshot(terminal.snapshot(), initial));
+	if deduplicator.admit(&snapshot) {
+		if let Some(previous) = held.replace(snapshot) {
+			draw(
+				rasterizer,
+				sinks,
+				pixels,
+				Frame::new(previous, *hold_ticks),
+				needs_pixels,
+			)?;
+		}
+		*hold_ticks = 1;
+	} else {
+		add_hold(hold_ticks, 1)?;
+	}
+	Ok(())
+}
+
+fn add_hold(hold_ticks: &mut u64, additional: u64) -> Result<()> {
+	*hold_ticks = hold_ticks
+		.checked_add(additional)
+		.context("replay frame hold exceeds limits")?;
+	Ok(())
+}
+
+fn tick_for_time(time: Duration, frames_per_second: u32) -> u64 {
+	let nanos = u128::from(time.as_secs()) * 1_000_000_000u128 + u128::from(time.subsec_nanos());
+	let ticks = (nanos * u128::from(frames_per_second)).div_ceil(1_000_000_000);
+	ticks.min(u128::from(u64::MAX)) as u64
 }
 
 fn finish_sinks(sinks: Vec<Box<dyn Sink>>) -> Result<()> {
@@ -333,5 +460,46 @@ mod tests {
 			.apply(event, initial, ResizePolicy::Reject)
 			.unwrap_err();
 		assert!(error.to_string().contains("changes terminal size"));
+	}
+
+	#[test]
+	fn replay_clock_caps_each_idle_gap_and_retains_final_inactivity() {
+		let mut clock = ReplayClock::new(Some(Duration::from_secs(1)));
+		let first = clock
+			.map_event(TimedTerminalEvent {
+				time: Duration::from_secs(2),
+				event: TerminalEvent::Output(Vec::new()),
+			})
+			.unwrap();
+		assert_eq!(first.time, Duration::from_secs(1));
+		let second = clock
+			.map_event(TimedTerminalEvent {
+				time: Duration::from_secs(10),
+				event: TerminalEvent::Output(Vec::new()),
+			})
+			.unwrap();
+		assert_eq!(second.time, Duration::from_secs(2));
+		assert_eq!(
+			clock.finish(Some(Duration::from_secs(20))).unwrap(),
+			Duration::from_secs(3)
+		);
+	}
+
+	#[test]
+	fn replay_clock_rejects_a_duration_before_the_last_event() {
+		let mut clock = ReplayClock::new(None);
+		clock
+			.map_event(TimedTerminalEvent {
+				time: Duration::from_secs(2),
+				event: TerminalEvent::Output(Vec::new()),
+			})
+			.unwrap();
+		assert!(clock.finish(Some(Duration::from_secs(1))).is_err());
+	}
+
+	#[test]
+	fn tick_for_time_rounds_up_without_iterating_the_idle_interval() {
+		assert_eq!(tick_for_time(Duration::from_millis(1), 30), 1);
+		assert_eq!(tick_for_time(Duration::from_secs(1), 30), 30);
 	}
 }
