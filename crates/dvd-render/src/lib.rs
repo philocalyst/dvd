@@ -56,6 +56,7 @@ pub use rio_vt;
 pub use vello_cpu::Pixmap;
 
 pub mod encode;
+pub mod asciicast;
 pub mod fonts;
 pub mod geom;
 pub mod grid;
